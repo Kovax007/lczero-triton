@@ -311,8 +311,8 @@ def test_autotune_contract_covers_semantics_and_warp_candidates() -> None:
     assert _layer_norm_kernel.cache_results
     assert _layer_norm_skip_kernel.cache_results
     for kernel in (_layer_norm_kernel, _layer_norm_skip_kernel):
-        assert tuple(config.num_warps for config in kernel.configs) == _WARP_COUNTS
-        assert all(not config.kwargs for config in kernel.configs)
+        assert tuple((config.num_warps, config.kwargs['online_algorithm']) for config in kernel.configs) == _WARP_COUNTS
+        assert all(len(config.kwargs) and "online_algorithm" in config.kwargs for config in kernel.configs)
 
 
 @pytest.mark.gpu
