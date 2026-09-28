@@ -6,9 +6,27 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from lc0ex import Buffer, ExecutableBuilder, ProgramBuilder
+from lc0ex import Buffer, ExecutableBuilder, ProgramBuilder, SymbolHandle
 from lc0ex.proto import lc0ex_metadata_pb2, lc0ex_pb2, net_pb2
 
+from lczero_triton.bt4._childq import (
+    ATOMS,
+    BINS_W,
+    KEY_B,
+    KEY_W,
+    OUTPUT_MEAN,
+    OUTPUT_VAR,
+    POSITION_B,
+    POSITION_W,
+    PROMOTION_W,
+    QUERY_B,
+    QUERY_W,
+    TOKENS_B,
+    TOKENS_W,
+    ChildQHead,
+    add_to_fingerprint,
+    read_childq_head,
+)
 from lczero_triton.bt4._format import (
     normalize_network,
     validate_network_format,
@@ -22,6 +40,16 @@ from lczero_triton.bt4.kernels.add_vectors import (
 from lczero_triton.bt4.kernels.batched_matmul import (
     BatchedMatmulSpecialization,
     batched_matmul,
+)
+from lczero_triton.bt4.kernels.childq_head import (
+    POLICY_OUTPUTS,
+    TERM_ROWS,
+    ChildQLinearSpecialization,
+    ChildQMomentsSpecialization,
+    ChildQSampleTermsSpecialization,
+    childq_linear,
+    childq_moments,
+    childq_sample_terms,
 )
 from lczero_triton.bt4 import _q1
 from lczero_triton.bt4.kernels.cutlass_gemm_i8 import (
@@ -72,6 +100,7 @@ from lczero_triton.bt4.kernels.quantise_operand import (
 )
 
 _F16_SIZE_BYTES = 2
+_F32_SIZE_BYTES = 4
 _INPUT_CHANNELS = 112
 _POSITION_CHANNELS = 12
 
@@ -82,6 +111,13 @@ _CUTLASS_FFN1 = os.environ.get("LC0EX_CUTLASS_FFN1") == "1"
 _CUTLASS_FFN2 = os.environ.get("LC0EX_CUTLASS_FFN2") == "1"
 _CUTLASS_OUTPROJ = os.environ.get("LC0EX_CUTLASS_OUTPROJ") == "1"
 _CUTLASS_QKV = os.environ.get("LC0EX_CUTLASS_QKV") == "1"
+# The child-Q head's three GEMMs: `f16` = the generic matmul kernel (FP16 accumulator, like BT4's own heads);
+# `f32` = the head's FP32-accumulator GEMM, with q and k stored float32. The head's softmax over its bins
+# amplifies accumulator rounding, so this is a precision choice with a measured cost.
+_CHILDQ_GEMM32 = os.environ.get("LC0EX_CHILDQ_GEMM", "f16") == "f32"
+# The child-Q outputs: `f32` (the contract's default) or `f16`, which halves their PCIe traffic. The backend
+# reads the buffer's declared type and converts, so the search still receives float32.
+_CHILDQ_OUTPUT_F16 = os.environ.get("LC0EX_CHILDQ_OUTPUT", "f32") == "f16"
 
 # Chunked attention segment (round 14 item A.2).  `LC0EX_SEGMENT_CHUNK` is the
 # chunk size in SAMPLES; 0 or unset leaves the segment whole and this file emits
@@ -142,6 +178,8 @@ class _BuildContext:
     fingerprint: net_pb2.Net
     fingerprint_layers: dict[str, net_pb2.Weights.Layer]
     shared_buffers: dict[str, Buffer]
+    childq: ChildQHead | None
+    childq_buffers: set[str]
     # B3 (Q1 on BT4): the int8 sites of every encoder, by the analyser's vector file; empty sets = the FP16 artifact.
     q1_sites: dict[int, frozenset[str]]
 
@@ -171,6 +209,17 @@ def build(
         ffn_activation=ffn_activation,
         smolgen_activation=smolgen_activation,
     )
+    childq = read_childq_head(network)
+    if childq is not None:
+        _LOGGER.info(
+            "child-Q head from ONNX initializers: width %d -> %d, depth %d, %d bins",
+            childq.source_width,
+            childq.embedding_width,
+            childq.model_width,
+            childq.bin_count,
+        )
+        add_to_fingerprint(fingerprint)
+    childq_buffers: set[str] = set()
     kernels = KernelCache(builder)
     shared_buffers: dict[str, Buffer] = {}
     q1_sites = _q1_plan(network.weights)
@@ -196,10 +245,18 @@ def build(
             fingerprint=fingerprint,
             fingerprint_layers=fingerprint_layers,
             shared_buffers=shared_buffers,
+            childq=childq,
+            childq_buffers=childq_buffers,
             q1_sites=q1_sites,
         )
         _network(context, network.weights)
         _LOGGER.info("finished program %s", program_name)
+    if childq is not None and childq_buffers != set(childq.buffers()):
+        message = (
+            f"child-Q head: the graph declares {sorted(childq_buffers)} but the "
+            f"net carries {sorted(childq.buffers())}"
+        )
+        raise ValueError(message)
     builder.set_metadata(fingerprint.SerializeToString(deterministic=True))
     _LOGGER.info("finished BT4 graph construction")
 
@@ -216,9 +273,11 @@ def _network(context: _BuildContext, weights: net_pb2.Weights) -> None:
     )
     body = _encoder_tower(context, body, body_width, weights, body_codes)
     _LOGGER.info("batch size %d: building output heads", context.batch_size)
-    _policy_head(context, body, body_width, weights)
+    mapping = _policy_head(context, body, body_width, weights)
     _value_head(context, body, body_width, weights.value_heads.winner)
     _moves_left_head(context, body, body_width, weights)
+    if context.childq is not None:
+        _childq_head(context, body, body_width, mapping)
 
 
 def _fingerprint_network(
@@ -1481,8 +1540,8 @@ def _policy_head(
     body: Buffer,
     body_width: int,
     weights: net_pb2.Weights,
-) -> None:
-    """Build the selected vanilla attention-policy branch."""
+) -> SymbolHandle:
+    """Build the selected vanilla attention-policy branch; return its policy map."""
     policy = weights.policy_heads.vanilla
 
     embedding_weights_layer = _policy_embedding_layer(weights, "ip_pol_w")
@@ -1626,6 +1685,7 @@ def _policy_head(
         mapping,
         PolicyMapSpecialization(context.batch_size, context.architecture),
     )
+    return mapping
 
 
 def _value_head(
@@ -1675,6 +1735,210 @@ def _moves_left_head(
         output_name="/output/mlh",
         output_width=1,
         final_activation="relu",
+    )
+
+
+def _childq_head(
+    context: _BuildContext,
+    body: Buffer,
+    body_width: int,
+    mapping: SymbolHandle,
+) -> None:
+    """Build the child-Q distribution head on the trunk output, beside the policy head.
+
+    tokens, q and k are the generic GEMM; the bin logits, promotion offsets, policy
+    gather, position bias, softmax and moments are the two `childq_head` kernels.
+    """
+    head = context.childq
+    if head is None:
+        message = "child-Q head requested for a net that carries none"
+        raise ValueError(message)
+    if head.source_width != body_width:
+        message = (
+            f"child-Q head reads width {head.source_width}, the trunk emits {body_width}"
+        )
+        raise ValueError(message)
+    weights = {
+        name: _childq_buffer(context, name, data_type, shape)
+        for name, (data_type, shape) in head.buffers().items()
+    }
+    output_type = (
+        lc0ex_pb2.Buffer.DATA_TYPE_F16
+        if _CHILDQ_OUTPUT_F16
+        else lc0ex_pb2.Buffer.DATA_TYPE_F32
+    )
+    means = context.builder.buffer(
+        name=OUTPUT_MEAN,
+        shape=(context.batch_size, POLICY_OUTPUTS),
+        dtype=output_type,
+        writable=True,
+    )
+    variances = context.builder.buffer(
+        name=OUTPUT_VAR,
+        shape=(context.batch_size, POLICY_OUTPUTS),
+        dtype=output_type,
+        writable=True,
+    )
+
+    token_rows = context.batch_size * _SQUARE_COUNT
+    tokens = _temporary_f16(context, element_count=token_rows * head.embedding_width)
+    if _CHILDQ_GEMM32:
+        queries, keys = _childq_projections32(context, body, body_width, tokens, weights)
+    else:
+        queries, keys = _childq_projections16(context, body, body_width, tokens, weights)
+    terms = context.builder.temporary_buffer(
+        size_bytes=context.batch_size * TERM_ROWS * head.bin_count * _F32_SIZE_BYTES,
+        alignment_bytes=256,
+    )
+    childq_sample_terms(
+        context.builder,
+        context.kernels,
+        terms,
+        tokens,
+        keys,
+        weights[POSITION_W],
+        weights[POSITION_B],
+        weights[PROMOTION_W],
+        ChildQSampleTermsSpecialization(
+            context.batch_size,
+            head.embedding_width,
+            head.model_width,
+            head.bin_count,
+            context.architecture,
+            projection_f32=_CHILDQ_GEMM32,
+        ),
+    )
+    childq_moments(
+        context.builder,
+        context.kernels,
+        means,
+        variances,
+        queries,
+        keys,
+        weights[BINS_W],
+        terms,
+        weights[ATOMS],
+        mapping,
+        ChildQMomentsSpecialization(
+            context.batch_size,
+            head.model_width,
+            head.bin_count,
+            context.architecture,
+            projection_f32=_CHILDQ_GEMM32,
+            output_f16=_CHILDQ_OUTPUT_F16,
+        ),
+    )
+
+
+def _childq_projections32(
+    context: _BuildContext,
+    body: Buffer,
+    body_width: int,
+    tokens: Buffer,
+    weights: dict[str, Buffer],
+) -> tuple[Buffer, Buffer]:
+    """tokens, q and k with the FP32-accumulator GEMM; q and k are stored float32."""
+    head = context.childq
+    token_rows = context.batch_size * _SQUARE_COUNT
+    childq_linear(
+        context.builder,
+        context.kernels,
+        tokens,
+        body,
+        weights[TOKENS_W],
+        weights[TOKENS_B],
+        ChildQLinearSpecialization(
+            token_rows, head.embedding_width, body_width, "mish", False, context.architecture
+        ),
+    )
+    queries = context.builder.temporary_buffer(
+        size_bytes=token_rows * head.model_width * _F32_SIZE_BYTES, alignment_bytes=256
+    )
+    keys = context.builder.temporary_buffer(
+        size_bytes=token_rows * head.model_width * _F32_SIZE_BYTES, alignment_bytes=256
+    )
+    for projected, weight_name, bias_name in (
+        (queries, QUERY_W, QUERY_B),
+        (keys, KEY_W, KEY_B),
+    ):
+        childq_linear(
+            context.builder,
+            context.kernels,
+            projected,
+            tokens,
+            weights[weight_name],
+            weights[bias_name],
+            ChildQLinearSpecialization(
+                token_rows, head.model_width, head.embedding_width, "none", True, context.architecture
+            ),
+        )
+    return queries, keys
+
+
+def _childq_projections16(
+    context: _BuildContext,
+    body: Buffer,
+    body_width: int,
+    tokens: Buffer,
+    weights: dict[str, Buffer],
+) -> tuple[Buffer, Buffer]:
+    """tokens, q and k with the generic FP16-accumulator matmul kernel, as the first patch built them."""
+    head = context.childq
+    token_rows = context.batch_size * _SQUARE_COUNT
+    matmul(
+        context.builder,
+        context.kernels,
+        tokens,
+        body,
+        weights[TOKENS_W],
+        MatmulSpecialization(
+            token_rows,
+            head.embedding_width,
+            body_width,
+            context.architecture,
+            has_bias=True,
+            activation="mish",
+        ),
+        bias=weights[TOKENS_B],
+    )
+    queries = _temporary_f16(context, element_count=token_rows * head.model_width)
+    keys = _temporary_f16(context, element_count=token_rows * head.model_width)
+    for projected, weight_name, bias_name in (
+        (queries, QUERY_W, QUERY_B),
+        (keys, KEY_W, KEY_B),
+    ):
+        matmul(
+            context.builder,
+            context.kernels,
+            projected,
+            tokens,
+            weights[weight_name],
+            MatmulSpecialization(
+                token_rows,
+                head.model_width,
+                head.embedding_width,
+                context.architecture,
+                has_bias=True,
+                activation="none",
+            ),
+            bias=weights[bias_name],
+        )
+    return queries, keys
+
+
+def _childq_buffer(
+    context: _BuildContext,
+    name: str,
+    data_type: int,
+    shape: tuple[int, ...],
+) -> Buffer:
+    """Declare one child-Q weight, named as the carrier's initializer."""
+    context.childq_buffers.add(name)
+    return context.builder.persistent_buffer(
+        name=name,
+        shape=shape,
+        dtype=data_type,
+        alignment_bytes=256,
     )
 
 

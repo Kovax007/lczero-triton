@@ -1,5 +1,6 @@
 """Autotuned contiguous FP16 dense matrix multiplication family."""
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -30,7 +31,10 @@ _MISH_BRANCH = tl.constexpr(-0.6)
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
 # Set this to false when the FP32 accumulator path is required for comparison.
-_USE_FP16_ACCUMULATOR = tl.constexpr(value=True)
+# Debug switch (child-Q port parity study): LC0EX_DEBUG_FP32_ACCUMULATOR=1 selects the FP32 accumulator.
+_USE_FP16_ACCUMULATOR = tl.constexpr(
+    value=os.environ.get("LC0EX_DEBUG_FP32_ACCUMULATOR") != "1"
+)
 _GROUP_SIZES_M = (1, 4, 8, 16)
 _TILE_CONFIGS = (
     # Large high-throughput tiles (for M>=1024, N>=1024, K>=512)
