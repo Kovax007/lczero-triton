@@ -212,6 +212,22 @@ if _EGT_OVERFLOW not in ("branch", "correction"):
     raise ValueError(message)
 # "auto": tiles at or below this rung, the FP16 copy above it (the tile buffer must stay inside L2; K2c report).
 _EGT_TILES_MAX_BATCH = int(os.environ.get("LC0EX_EGT_TILES_MAX_BATCH", "16"))
+# B9 (Menkib's kernel audit, 09-26): the EGT2 attention kernel's arithmetic. LC0EX_EGT_ACC: "f32" (default, the served
+# FP32 accumulators) or "f16" (the six dots accumulate in FP16). LC0EX_EGT_STATE_MATH: "f32" (default) or "f16" (the
+# read / door / gate tiles formed in FP16). LC0EX_EGT_LIST_F16=1 is the gate's CONTROL (FP16 prefix sums): never served.
+_EGT_ACC = os.environ.get("LC0EX_EGT_ACC", "f32")
+_EGT_STATE_MATH = os.environ.get("LC0EX_EGT_STATE_MATH", "f32")
+_EGT_LIST_F16 = os.environ.get("LC0EX_EGT_LIST_F16") == "1"
+# LC0EX_EGT_ARITH=auto (B9's shipping form): autotune picks, per rung and card, the served arithmetic or
+# LC0EX_EGT_ACC=f16 + LC0EX_EGT_STATE_MATH=f16 (gated equivalent); exclusive with setting either of those two.
+_EGT_ARITH_AUTO = os.environ.get("LC0EX_EGT_ARITH", "fixed") == "auto"
+if _EGT_ARITH_AUTO and (_EGT_ACC == "f16" or _EGT_STATE_MATH == "f16"):
+    message = "LC0EX_EGT_ARITH=auto chooses the arithmetic itself; unset LC0EX_EGT_ACC / LC0EX_EGT_STATE_MATH"
+    raise ValueError(message)
+for _name, _value in (("LC0EX_EGT_ACC", _EGT_ACC), ("LC0EX_EGT_STATE_MATH", _EGT_STATE_MATH)):
+    if _value not in ("f32", "f16"):
+        message = f"{_name}={_value!r}; expected f32 or f16"
+        raise ValueError(message)
 # Round 22 K4b: how a triplet site is staged. "scratch" is K5 as served (K4's prep/contract/out between K3's
 # readback and ffn stages), "readback_prep" fuses K3's readback into prep (K4b step a), "fused" runs prep and
 # contract in one program per (sample, direction, head) with no scratch buffers (K4b step b). `out` and the FFN
@@ -1087,6 +1103,8 @@ def _encoder_egt(  # noqa: PLR0913
         "overflow_exact": _EGT_OVERFLOW == "branch", "quant_output": fused_codes,
         "output_gate": gated,
         "gate_scale": (float(_OGATE_SCALE_CONTROL) if _OGATE_SCALE_CONTROL else block.gate_scale) if gated else 2.0,
+        "accumulate_f16": _EGT_ACC == "f16", "state_math_f16": _EGT_STATE_MATH == "f16", "list_f16": _EGT_LIST_F16,
+        "arithmetic_auto": _EGT_ARITH_AUTO,
     }
     if not reads:
         # r23b §7: this block does not read the edge stream. q.k and the four E terms stay; the edge read, door and

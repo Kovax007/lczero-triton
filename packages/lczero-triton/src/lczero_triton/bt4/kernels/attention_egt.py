@@ -65,6 +65,7 @@ With `export_h`, H (post-door, pre-softmax) goes to FP32 ``[batch * heads, 64, 6
 ``(sample * heads + head) * 4096 + 64 * i + j``: the layout of static's smolgen logits, read by `edge_site`.
 """
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import cast
@@ -198,8 +199,12 @@ def _list_terms(  # noqa: PLR0913
     scaled_coefficients, coefficient_vector, sample, head, grid,
     capacity: tl.constexpr, use_query: tl.constexpr, use_attack: tl.constexpr, use_key: tl.constexpr,
     use_scaled: tl.constexpr, coefficient_vectors: tl.constexpr, scaled_stream: tl.constexpr,
+    list_f16: tl.constexpr = False,
 ):
-    """The four E terms of one head over the position's set-bit list: ``[4096]`` dense, K2's prefix-sum form."""
+    """The four E terms of one head over the position's set-bit list: ``[4096]`` dense, K2's prefix-sum form.
+
+    `list_f16` (B9 CONTROL, must fail): the prefix sums in FP16 -- a reduction over up to `capacity` entries.
+    """
     bits = tl.arange(0, capacity)
     valid = bits < tl.minimum(tl.load(counts + sample), capacity - 1)
     cell = tl.where(valid, tl.load(cells + sample * capacity + bits).to(tl.int32), 0)
@@ -228,10 +233,13 @@ def _list_terms(  # noqa: PLR0913
     contribution = tl.where(valid, contribution, 0.0)
     # sums[b] = contributions of bits 0..b-1, so a cell's total is sums[end] - sums[start].
     shifted = tl.where(bits > 0, tl.gather(contribution, tl.maximum(bits - 1, 0), 0), 0.0)
-    sums = tl.cumsum(shifted, 0)
+    if list_f16:
+        sums = tl.cumsum(shifted.to(tl.float16), 0)
+    else:
+        sums = tl.cumsum(shifted, 0)
     start = tl.load(prefix + sample * 2 * 4096 + grid).to(tl.int32)
     end = tl.load(prefix + sample * 2 * 4096 + 4096 + grid).to(tl.int32)
-    dense = tl.gather(sums, end, 0) - tl.gather(sums, start, 0)
+    dense = (tl.gather(sums, end, 0) - tl.gather(sums, start, 0)).to(tl.float32)
     if use_scaled and scaled_stream:
         shifted_scaled = tl.where(bits > 0, tl.gather(scaled_contribution, tl.maximum(bits - 1, 0), 0), 0.0)
         sums_scaled = tl.cumsum(shifted_scaled, 0)
@@ -270,14 +278,16 @@ def _dense_terms(  # noqa: PLR0913
 
 # ---------------------------------------------------------------- attention, one program per (sample, head)
 _WARPS = (2, 4, 8, 16)
+_LOGGER = logging.getLogger(__name__)
+_ATTENTION_KEY = ["batch_count", "heads", "head_dim", "capacity", "cap", "export_h", "export_weights", "use_qk",
+                  "use_attack", "use_key", "use_query", "use_scaled", "use_read", "use_door", "use_gate", "state_tiles",
+                  "round_heads", "head_base", "coefficient_vectors", "scaled_stream", "overflow_exact", "overflow_only",
+                  "state_f8", "state_i8", "quant_output", "output_gate", "acc_f16", "state_math_f16", "list_f16"]
 
 
 @triton.autotune(
     configs=[triton.Config({}, num_warps=warps) for warps in _WARPS],
-    key=["batch_count", "heads", "head_dim", "capacity", "cap", "export_h", "export_weights", "use_qk", "use_attack",
-         "use_key", "use_query", "use_scaled", "use_read", "use_door", "use_gate", "state_tiles", "round_heads",
-         "head_base", "coefficient_vectors", "scaled_stream", "overflow_exact", "overflow_only",
-         "state_f8", "state_i8", "quant_output", "output_gate"],
+    key=_ATTENTION_KEY,
     cache_results=True,
 )
 @triton.jit
@@ -334,6 +344,9 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
     quant_output: tl.constexpr = False,
     output_gate: tl.constexpr = False,
     gate_scale: tl.constexpr = 2.0,
+    acc_f16: tl.constexpr = False,
+    state_math_f16: tl.constexpr = False,
+    list_f16: tl.constexpr = False,
 ) -> None:
     """One head's EGT2 attention block end to end.
 
@@ -344,6 +357,14 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
     `output_gate` (O on the EGT2 blocks, round 26b): `qkv` is the packed `[q | k | v | g]` (stride 4 width) and the
     attended tile is multiplied by `gate_scale * sigmoid(g)` in FP32 before the store -- the attention OUTPUT gate
     (`mha_output_gate`), not the edge door's per-head gate (`use_gate`).
+
+    B9 (Menkib's kernel audit, 09-26), all off by default (off = the served arithmetic, bit for bit):
+    `acc_f16` -- the six dots accumulate in FP16 (GeForce Ada / Blackwell run FP16 x FP16 -> FP32 MMA at half the
+    FP16-accumulate rate, and an FP32 accumulator tile holds twice the registers). Every one of them reduces over
+    at most 64 terms (head_dim or the 64 keys); q.k is scaled after the dot, in FP32. `state_math_f16` -- the three
+    [64, 64] state tiles (read, door, gate) are formed in FP16 from the FP16 state copy or tiles (16 terms each) and
+    widened to FP32 only where they meet the FP32 logits. `list_f16` is the CONTROL that must fail the gate: the E
+    terms' prefix sums over up to `capacity` list entries in FP16 -- a long reduction without a flush.
     """
     program = tl.program_id(0)
     sample = program // round_heads
@@ -366,7 +387,10 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
 
     scores = tl.zeros((64, 64), dtype=tl.float32)
     if use_qk:
-        scores += tl.dot(query, tl.trans(key), input_precision="ieee", out_dtype=tl.float32) * tl.load(qk_scale + head)
+        if acc_f16:
+            scores += tl.dot(query, tl.trans(key), out_dtype=tl.float16).to(tl.float32) * tl.load(qk_scale + head)
+        else:
+            scores += tl.dot(query, tl.trans(key), input_precision="ieee", out_dtype=tl.float32) * tl.load(qk_scale + head)
 
     if use_edges:
         grid = tl.arange(0, 4096)
@@ -380,9 +404,15 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
             row_narrow = tl.zeros((64, 2), dtype=tl.float32)
             if use_query:
                 table = tl.load(query_table + pair + wide[None, :] * head_dim + depth[:, None]).to(query.dtype)
-                row_wide += tl.dot(query, table, input_precision="ieee", out_dtype=tl.float32)
+                if acc_f16:
+                    row_wide += tl.dot(query, table, out_dtype=tl.float16).to(tl.float32)
+                else:
+                    row_wide += tl.dot(query, table, input_precision="ieee", out_dtype=tl.float32)
                 table = tl.load(query_table + pair + (32 + narrow[None, :]) * head_dim + depth[:, None]).to(query.dtype)
-                row_narrow += tl.dot(query, table, input_precision="ieee", out_dtype=tl.float32)
+                if acc_f16:
+                    row_narrow += tl.dot(query, table, out_dtype=tl.float16).to(tl.float32)
+                else:
+                    row_narrow += tl.dot(query, table, input_precision="ieee", out_dtype=tl.float32)
             if use_attack:
                 row_wide += tl.load(attack + head * 34 + wide)[None, :]
                 row_narrow += tl.load(attack + head * 34 + 32 + narrow)[None, :]
@@ -393,9 +423,16 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
             row_narrow_flat = tl.zeros((128,), dtype=tl.float32)
         if use_key:
             table = tl.load(key_table + pair + wide[None, :] * head_dim + depth[:, None]).to(key.dtype)
-            column_flat = tl.reshape(tl.dot(key, table, input_precision="ieee", out_dtype=tl.float32), (2048,))
+            if acc_f16:
+                column_flat = tl.reshape(tl.dot(key, table, out_dtype=tl.float16).to(tl.float32), (2048,))
+            else:
+                column_flat = tl.reshape(tl.dot(key, table, input_precision="ieee", out_dtype=tl.float32), (2048,))
             table = tl.load(key_table + pair + (32 + narrow[None, :]) * head_dim + depth[:, None]).to(key.dtype)
-            column_narrow_flat = tl.reshape(tl.dot(key, table, input_precision="ieee", out_dtype=tl.float32), (128,))
+            if acc_f16:
+                column_narrow_flat = tl.reshape(tl.dot(key, table, out_dtype=tl.float16).to(tl.float32), (128,))
+            else:
+                column_narrow_flat = tl.reshape(tl.dot(key, table, input_precision="ieee", out_dtype=tl.float32),
+                                                (128,))
         else:
             column_flat = tl.zeros((2048,), dtype=tl.float32)
             column_narrow_flat = tl.zeros((128,), dtype=tl.float32)
@@ -416,12 +453,12 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
                 dense = _list_terms(cells, channels, prefix, counts, normalization, row_flat, row_narrow_flat,
                                     column_flat, column_narrow_flat, scaled_coefficients, coefficient_vector,
                                     sample, head, grid, capacity, use_query, use_attack, use_key, use_scaled,
-                                    coefficient_vectors, scaled_stream)
+                                    coefficient_vectors, scaled_stream, list_f16)
         else:
             dense = _list_terms(cells, channels, prefix, counts, normalization, row_flat, row_narrow_flat,
                                 column_flat, column_narrow_flat, scaled_coefficients, coefficient_vector,
                                 sample, head, grid, capacity, use_query, use_attack, use_key, use_scaled,
-                                coefficient_vectors, scaled_stream)
+                                coefficient_vectors, scaled_stream, list_f16)
         if use_scaled:
             dense += normalization * tl.load(constant_bias + head * 4096 + grid)
         scores += tl.reshape(dense, (64, 64))
@@ -430,40 +467,53 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
         if state_tiles:
             # K2c: this head's three read tiles, built once per (sample, round) by `egt_state_tiles`.
             tile_base = (sample * round_heads + (head - head_base)) * 3 * 4096
-            read = tl.load(edge_state + tile_base + direct).to(tl.float32)
-            door = tl.load(edge_state + tile_base + 4096 + direct).to(tl.float32)
-            gate = tl.load(edge_state + tile_base + 8192 + direct).to(tl.float32)
+            if state_math_f16:  # B9: the FP16 tiles as stored
+                read = tl.load(edge_state + tile_base + direct).to(tl.float16)
+                door = tl.load(edge_state + tile_base + 4096 + direct).to(tl.float16)
+                gate = tl.load(edge_state + tile_base + 8192 + direct).to(tl.float16)
+            else:
+                read = tl.load(edge_state + tile_base + direct).to(tl.float32)
+                door = tl.load(edge_state + tile_base + 4096 + direct).to(tl.float32)
+                gate = tl.load(edge_state + tile_base + 8192 + direct).to(tl.float32)
         else:
-            read = tl.zeros((64, 64), dtype=tl.float32)
-            door = tl.zeros((64, 64), dtype=tl.float32)
-            gate = tl.zeros((64, 64), dtype=tl.float32)
+            if state_math_f16:  # B9: three FP16 tiles, 16 terms each
+                read = tl.zeros((64, 64), dtype=tl.float16)
+                door = tl.zeros((64, 64), dtype=tl.float16)
+                gate = tl.zeros((64, 64), dtype=tl.float16)
+            else:
+                read = tl.zeros((64, 64), dtype=tl.float32)
+                door = tl.zeros((64, 64), dtype=tl.float32)
+                gate = tl.zeros((64, 64), dtype=tl.float32)
             state_base = sample * 16 * 4096
             for state_channel in tl.static_range(16):
-                tile = tl.load(edge_state + state_base + state_channel * 4096 + direct).to(tl.float32)
+                if state_math_f16:
+                    tile = tl.load(edge_state + state_base + state_channel * 4096 + direct).to(tl.float16)
+                else:
+                    tile = tl.load(edge_state + state_base + state_channel * 4096 + direct).to(tl.float32)
                 if state_f8 or state_i8:  # r23b I8: the int8 copy folds its scale exactly as e4m3 does
                     # r23 F8: e4m3 stores the channel in units of `state_scales[c]`. The scale is a compile-time
                     # constant, so it folds into the plan's SCALAR weight -- one extra multiply per (term,
                     # channel), never one per element of the [64, 64] tile.
                     if use_read:
                         read += (tl.load(read_weights + head * 16 + state_channel)
-                                 * state_scales[state_channel]) * tile
+                                 * state_scales[state_channel]).to(tile.dtype) * tile
                     if use_door:
                         door += (tl.load(door_weights + head * 16 + state_channel)
-                                 * state_scales[state_channel]) * tile
+                                 * state_scales[state_channel]).to(tile.dtype) * tile
                     if use_gate:
                         gate += (tl.load(gate_weights + head * 16 + state_channel)
-                                 * state_scales[state_channel]) * tile
+                                 * state_scales[state_channel]).to(tile.dtype) * tile
                 else:
                     if use_read:
-                        read += tl.load(read_weights + head * 16 + state_channel) * tile
+                        read += tl.load(read_weights + head * 16 + state_channel).to(tile.dtype) * tile
                     if use_door:
-                        door += tl.load(door_weights + head * 16 + state_channel) * tile
+                        door += tl.load(door_weights + head * 16 + state_channel).to(tile.dtype) * tile
                     if use_gate:
-                        gate += tl.load(gate_weights + head * 16 + state_channel) * tile
+                        gate += tl.load(gate_weights + head * 16 + state_channel).to(tile.dtype) * tile
         if use_read:
-            scores += read
+            scores += read.to(tl.float32)
         if use_door:
-            scores = scores * (1.0 + door)
+            scores = scores * (1.0 + door.to(tl.float32))
 
     if export_h:
         tl.store(logits + matrix * 4096 + direct, scores)
@@ -472,7 +522,7 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
     exponentials = tl.exp(scores - maximum[:, None])
     probabilities = exponentials / tl.sum(exponentials, axis=1)[:, None]
     if use_gate:
-        gate += tl.load(gate_bias + head)
+        gate = gate.to(tl.float32) + tl.load(gate_bias + head)
         if cap:
             probabilities = probabilities * tl.where(gate >= 0.0, 1.0, 2.0 * tl.sigmoid(gate))
         else:
@@ -481,20 +531,35 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
         tl.store(weights + matrix * 4096 + direct, probabilities)
 
     values = tl.load(qkv + row_base + 2 * width + squares[:, None] * stride + depth[None, :])
-    attended = tl.dot(probabilities.to(values.dtype), values, input_precision="ieee", out_dtype=tl.float32)
+    if acc_f16:
+        attended = tl.dot(probabilities.to(values.dtype), values, out_dtype=tl.float16)
+    else:
+        attended = tl.dot(probabilities.to(values.dtype), values, input_precision="ieee", out_dtype=tl.float32)
     if output_gate:
-        # O: `gate_scale * sigmoid(g)` per (square, channel) of this head, in FP32 on the FP32 accumulator, as
-        # `attention_static` does; the lab computes the gate in float32 because it multiplies the whole branch.
+        # O: `gate_scale * sigmoid(g)` per (square, channel) of this head, in FP32 on the accumulator (B9's FP16
+        # accumulator is widened by the FP32 gate), as `attention_static` does; the lab computes the gate in float32.
         pre_activation = tl.load(qkv + row_base + 3 * width + squares[:, None] * stride + depth[None, :])
         attended = attended * (gate_scale * tl.sigmoid(pre_activation.to(tl.float32)))
     destination = output + sample * 64 * width + squares[:, None] * width + head * head_dim + depth[None, :]
     if quant_output:
         # The same rule as every int8 the artifact writes (`layer_norm`, `quantise_operand`, `cutlass_gemm_i8`).
         prescale = tl.load(quant_prescale + head * head_dim + depth)
-        codes = tl.clamp(tl.floor(attended * prescale[None, :] + 0.5), -127.0, 127.0)
+        codes = tl.clamp(tl.floor(attended.to(tl.float32) * prescale[None, :] + 0.5), -127.0, 127.0)
         tl.store(destination, codes.to(tl.int8))
     else:
         tl.store(destination, attended.to(tl.float16))
+
+
+# B9 `arithmetic_auto`: the same JIT function, autotuned over warps x {the served FP32 arithmetic, FP16 accumulate +
+# FP16 state tiles}. Both forms are gated as equivalent (FP16-twin KL 9e-6); which is faster depends on the rung AND the
+# card (wave quantisation: 512 programs on 128 SMs are two full waves at 2 programs / SM, 1 1/3 at 3), so the build picks
+# per rung per card, exactly as it picks num_warps.
+_attention_egt_kernel_auto = triton.autotune(
+    configs=[triton.Config({"acc_f16": f16, "state_math_f16": f16}, num_warps=warps)
+             for f16 in (False, True) for warps in _WARPS],
+    key=[name for name in _ATTENTION_KEY if name not in ("acc_f16", "state_math_f16")],
+    cache_results=True,
+)(_attention_egt_kernel.fn)
 
 
 # ---------------------------------------------------------------- specializations, compile, builder
@@ -548,6 +613,12 @@ class AttentionEgtSpecialization:
     # O (round 26b): the attention output gate as the fourth lane of the packed projection, `[q | k | v | g]`.
     output_gate: bool = False
     gate_scale: float = 2.0
+    # B9 (Menkib's kernel audit): FP16 accumulate in the six dots; FP16 state-tile math; the CONTROL (FP16 prefix sums).
+    accumulate_f16: bool = False
+    state_math_f16: bool = False
+    list_f16: bool = False
+    # B9: let autotune choose between the served arithmetic and accumulate_f16 + state_math_f16, per rung per card.
+    arithmetic_auto: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,6 +634,9 @@ class EgtEdgeList:
 
 
 def _check(specialization: AttentionEgtSpecialization) -> None:
+    if specialization.arithmetic_auto and (specialization.accumulate_f16 or specialization.state_math_f16):
+        message = "arithmetic_auto chooses accumulate_f16 / state_math_f16 itself; do not set them too"
+        raise ValueError(message)
     if not 0 < specialization.logit_terms <= EGT_FULL:
         message = f"logit_terms={specialization.logit_terms} is out of range (1..{EGT_FULL})"
         raise ValueError(message)
@@ -690,7 +764,10 @@ def launch_attention_egt(  # noqa: PLR0913
         message = "quant_output and a quant_prescale tensor must come together"
         raise ValueError(message)
     placeholder = tables["qk_scale"]
-    return _attention_egt_kernel[_autotune_grid](
+    kernel = _attention_egt_kernel_auto if specialization.arithmetic_auto else _attention_egt_kernel
+    arithmetic = ({} if specialization.arithmetic_auto
+                  else {"acc_f16": specialization.accumulate_f16, "state_math_f16": specialization.state_math_f16})
+    return kernel[_autotune_grid](
         output,
         logits if logits is not None else placeholder,
         weights if weights is not None else placeholder,
@@ -722,6 +799,8 @@ def launch_attention_egt(  # noqa: PLR0913
         quant_output=specialization.quant_output,
         output_gate=specialization.output_gate,
         gate_scale=specialization.gate_scale,
+        **arithmetic,
+        list_f16=specialization.list_f16,
     )
 
 
@@ -785,8 +864,14 @@ def compile_attention_egt(specialization: AttentionEgtSpecialization) -> KernelA
         tables, specialization, logits=logits, weights=logits,
         quant_prescale=torch.ones(width, dtype=torch.float32, device="cuda") if specialization.quant_output else None,
     )
+    autotuner = _attention_egt_kernel_auto if specialization.arithmetic_auto else _attention_egt_kernel
+    if specialization.arithmetic_auto:
+        best = getattr(autotuner, "best_config", None)
+        _LOGGER.info("EGT2 attention arithmetic auto: batch_count=%d overflow_only=%s export_h=%s -> %s",
+                     specialization.batch_count, specialization.overflow_only, specialization.export_h,
+                     str(best) if best is not None else "cached (see the Triton cache)")
     return artifact_from_triton(compiled, grid=(grid_size(specialization), 1, 1), parameters=(_POINTER,) * 22,
-                                autotuner=_attention_egt_kernel)
+                                autotuner=autotuner)
 
 
 def _edge_list_tensors(specialization: EgtEdgeListSpecialization) -> tuple[torch.Tensor, ...]:
