@@ -23,6 +23,11 @@ from lczero_triton.bt4.kernels.batched_matmul import (
     BatchedMatmulSpecialization,
     batched_matmul,
 )
+from lczero_triton.bt4 import _q1
+from lczero_triton.bt4.kernels.cutlass_gemm_i8 import (
+    CutlassGemmI8Specialization,
+    cutlass_gemm_i8,
+)
 from lczero_triton.bt4.kernels.cutlass_matmul import (
     CutlassMatmulSpecialization,
     cutlass_matmul,
@@ -60,6 +65,10 @@ from lczero_triton.bt4.kernels.preprocess_attention_body import (
 from lczero_triton.bt4.kernels.promotion_logits import (
     PromotionLogitsSpecialization,
     promotion_logits,
+)
+from lczero_triton.bt4.kernels.quantise_operand import (
+    QuantiseOperandSpecialization,
+    quantise_operand,
 )
 
 _F16_SIZE_BYTES = 2
@@ -133,6 +142,8 @@ class _BuildContext:
     fingerprint: net_pb2.Net
     fingerprint_layers: dict[str, net_pb2.Weights.Layer]
     shared_buffers: dict[str, Buffer]
+    # B3 (Q1 on BT4): the int8 sites of every encoder, by the analyser's vector file; empty sets = the FP16 artifact.
+    q1_sites: dict[int, frozenset[str]]
 
 
 def build(
@@ -162,6 +173,7 @@ def build(
     )
     kernels = KernelCache(builder)
     shared_buffers: dict[str, Buffer] = {}
+    q1_sites = _q1_plan(network.weights)
     _LOGGER.info(
         "building BT4 graph for batch sizes %s with %d encoder layers",
         batch_sizes,
@@ -184,6 +196,7 @@ def build(
             fingerprint=fingerprint,
             fingerprint_layers=fingerprint_layers,
             shared_buffers=shared_buffers,
+            q1_sites=q1_sites,
         )
         _network(context, network.weights)
         _LOGGER.info("finished program %s", program_name)
@@ -195,13 +208,13 @@ def _network(context: _BuildContext, weights: net_pb2.Weights) -> None:
     """Build inputs, body embedding, encoders, and selected output heads."""
     _LOGGER.info("batch size %d: building input embedding", context.batch_size)
     inputs = _inputs(context)
-    body, body_width = _embedding(context, inputs, weights)
+    body, body_width, body_codes = _embedding(context, inputs, weights)
     _LOGGER.info(
         "batch size %d: building encoder tower (%d layers)",
         context.batch_size,
         len(weights.encoder),
     )
-    body = _encoder_tower(context, body, body_width, weights)
+    body = _encoder_tower(context, body, body_width, weights, body_codes)
     _LOGGER.info("batch size %d: building output heads", context.batch_size)
     _policy_head(context, body, body_width, weights)
     _value_head(context, body, body_width, weights.value_heads.winner)
@@ -391,8 +404,11 @@ def _embedding(
     context: _BuildContext,
     inputs: tuple[Buffer, Buffer],
     weights: net_pb2.Weights,
-) -> tuple[Buffer, int]:
-    """Build dense positional preprocessing, gated embedding, and embedding FFN."""
+) -> tuple[Buffer, int, Buffer | None]:
+    """Build dense positional preprocessing, gated embedding, and embedding FFN.
+
+    B3: when encoder 0's `attn_in` is int8, the last norm also writes its int8 copy (the third return value).
+    """
     position_input_width = _SQUARE_COUNT * _POSITION_CHANNELS
     position_weights, position_output_width = _matrix_f16(
         context,
@@ -666,24 +682,18 @@ def _embedding(
         alpha=alpha,
     )
     body = _temporary_f16(context, element_count=token_rows * body_width)
-    layer_norm(
-        context.builder,
-        context.kernels,
+    codes = _q1_norm(
+        context,
         body,
         branch,
-        None,
         ffn_gammas,
         ffn_betas,
-        LayerNormSpecialization(
-            row_count=token_rows,
-            width=body_width,
-            activation="none",
-            has_skip=False,
-            has_bias=False,
-            architecture=context.architecture,
-        ),
+        token_rows,
+        body_width,
+        "/encoder0" if "attn_in" in context.q1_sites.get(0, frozenset()) else None,
+        "attn_in",
     )
-    return body, body_width
+    return body, body_width, codes
 
 
 def _encoder_tower(
@@ -691,8 +701,12 @@ def _encoder_tower(
     body: Buffer,
     body_width: int,
     weights: net_pb2.Weights,
+    body_codes: Buffer | None = None,
 ) -> Buffer:
-    """Visit each protobuf encoder in evaluation order without fixed depth."""
+    """Visit each protobuf encoder in evaluation order without fixed depth.
+
+    B3: `body_codes` is the int8 copy of `body` that the next encoder's `attn_in` reads, when that site is int8.
+    """
     for index, encoder in enumerate(weights.encoder):
         _LOGGER.info(
             "batch size %d: building encoder %d/%d",
@@ -700,7 +714,7 @@ def _encoder_tower(
             index + 1,
             len(weights.encoder),
         )
-        body = _encoder(
+        body, body_codes = _encoder(
             context,
             body,
             body_width,
@@ -708,6 +722,8 @@ def _encoder_tower(
             prefix=f"/encoder{index}",
             head_count=weights.headcount,
             shared_smolgen=weights.smolgen_w if _has_smolgen(weights) else None,
+            index=index,
+            body_codes=body_codes,
         )
     return body
 
@@ -732,8 +748,13 @@ def _encoder(  # noqa: PLR0913
     prefix: str,
     head_count: int,
     shared_smolgen: net_pb2.Weights.Layer | None,
-) -> Buffer:
-    """Build one attention and FFN encoder residual block, smolgen optional."""
+    index: int = 0,
+    body_codes: Buffer | None = None,
+) -> tuple[Buffer, Buffer | None]:
+    """Build one attention and FFN encoder residual block, smolgen optional.
+
+    Returns the block's output and, when the next encoder's `attn_in` is int8, its ln2's int8 copy (B3).
+    """
     if shared_smolgen is None:
         smolgen, generated_width = None, 0
     else:
@@ -745,7 +766,11 @@ def _encoder(  # noqa: PLR0913
             prefix=prefix,
             head_count=head_count,
         )
-    attended = _attention(
+    sites = context.q1_sites.get(index, frozenset())
+    if "attn_in" in sites and body_codes is None:
+        message = f"{prefix}: attn_in is int8 but its producer (the previous norm) wrote no int8 copy"
+        raise ValueError(message)
+    attended, attended_codes = _attention(
         context,
         body,
         smolgen,
@@ -755,8 +780,12 @@ def _encoder(  # noqa: PLR0913
         head_count=head_count,
         shared_smolgen=shared_smolgen,
         generated_width=generated_width,
+        sites=sites,
+        body_codes=body_codes,
     )
-    return _ffn(context, attended, body_width, encoder, prefix=prefix)
+    following = f"/encoder{index + 1}" if "attn_in" in context.q1_sites.get(index + 1, frozenset()) else None
+    return _ffn(context, attended, body_width, encoder, prefix=prefix, sites=sites, body_codes=attended_codes,
+                next_attn_in=following)
 
 
 def _smolgen(  # noqa: PLR0913
@@ -924,8 +953,15 @@ def _attention(  # noqa: PLR0913
     head_count: int,
     shared_smolgen: net_pb2.Weights.Layer | None,
     generated_width: int,
-) -> Buffer:
-    """Build the encoder Q/K/V attention path, with smolgen if the net has it."""
+    sites: frozenset[str] = frozenset(),
+    body_codes: Buffer | None = None,
+) -> tuple[Buffer, Buffer | None]:
+    """Build the encoder Q/K/V attention path, with smolgen if the net has it.
+
+    B3: `attn_in` int8 = the QKV projection on `cutlass_gemm_i8` from `body_codes`; `attn_out` int8 = a
+    `quantise_operand` pass after the attention kernel, then the out-projection with alpha and the skip in its
+    epilogue; `ffn_in` int8 = ln1 also writes its int8 copy (the second return value).
+    """
     mha = encoder.mha
     path = f"weights.{prefix[1:]}"
     has_smolgen = shared_smolgen is not None and smolgen is not None
@@ -1017,6 +1053,9 @@ def _attention(  # noqa: PLR0913
     token_rows = context.batch_size * _SQUARE_COUNT
     attention_batches = context.batch_size * head_count
     chunk = _segment_chunk(context.batch_size)
+    if chunk and sites:
+        message = f"{prefix}: B3's int8 sites are built for the unchunked segment (unset LC0EX_SEGMENT_CHUNK)"
+        raise NotImplementedError(message)
     chunk_count = context.batch_size // chunk if chunk else 1
     chunk_rows = token_rows // chunk_count
     chunk_batches = attention_batches // chunk_count
@@ -1129,7 +1168,10 @@ def _attention(  # noqa: PLR0913
                     context.architecture,
                 ),
             )
-        if _CUTLASS_QKV:
+        if "attn_in" in sites:
+            _q1_gemm(context, qkv_activations, body_codes, prefix, "attn_in", chunk_rows, 3 * model_width, body_width,
+                     epilogue="bias")
+        elif _CUTLASS_QKV:
             cutlass_matmul(
                 context.builder,
                 context.kernels,
@@ -1179,7 +1221,20 @@ def _attention(  # noqa: PLR0913
                 has_smolgen=has_smolgen,
             ),
         )
-        if _CUTLASS_OUTPROJ:
+        if "attn_out" in sites:
+            merged_codes = _q1_codes(context, chunk_rows * model_width)
+            quantise_operand(
+                context.builder,
+                context.kernels,
+                merged_codes,
+                merged,
+                _q1_vector(context, prefix, "attn_out", "r", model_width),
+                None,
+                QuantiseOperandSpecialization(chunk_rows, model_width, context.architecture),
+            )
+            _q1_gemm(context, branch, merged_codes, prefix, "attn_out", chunk_rows, body_width, model_width,
+                     epilogue="residual", skip=body_chunk)
+        elif _CUTLASS_OUTPROJ:
             cutlass_matmul(
                 context.builder,
                 context.kernels,
@@ -1235,25 +1290,23 @@ def _attention(  # noqa: PLR0913
                     architecture=context.architecture,
                 ),
             )
+    attended_codes = None
     if _CHUNK_LN_WHOLE:
-        layer_norm(
-            context.builder,
-            context.kernels,
+        attended_codes = _q1_norm(
+            context,
             attended,
             whole_branch,
-            None,
             gammas,
             betas,
-            LayerNormSpecialization(
-                row_count=token_rows,
-                width=body_width,
-                activation="none",
-                has_skip=False,
-                has_bias=False,
-                architecture=context.architecture,
-            ),
+            token_rows,
+            body_width,
+            prefix if "ffn_in" in sites else None,
+            "ffn_in",
         )
-    return attended
+    elif "ffn_in" in sites:
+        message = f"{prefix}: B3's ffn_in copy is written by the whole ln1 (LC0EX_CHUNK_LN=whole)"
+        raise NotImplementedError(message)
+    return attended, attended_codes
 
 def _ffn(
     context: _BuildContext,
@@ -1262,8 +1315,17 @@ def _ffn(
     encoder: net_pb2.Weights.EncoderLayer,
     *,
     prefix: str,
-) -> Buffer:
-    """Build an encoder FFN and its DeepNorm residual layer normalization."""
+    sites: frozenset[str] = frozenset(),
+    body_codes: Buffer | None = None,
+    next_attn_in: str | None = None,
+) -> tuple[Buffer, Buffer | None]:
+    """Build an encoder FFN and its DeepNorm residual layer normalization.
+
+    B3: `ffn_in` int8 = FFN1 on `cutlass_gemm_i8` (Mish in its epilogue) from ln1's copy; `ffn_mid` int8 = FFN1's
+    epilogue writes the hidden as int8 codes (or, when FFN1 stays FP16, a `quantise_operand` pass does) and FFN2 runs
+    on `cutlass_gemm_i8` with alpha and the skip in its epilogue. `next_attn_in` (the next encoder's prefix) makes ln2
+    write the int8 copy that encoder's QKV reads (the second return value).
+    """
     path = f"weights.{prefix[1:]}"
     dense1_weights, hidden_width = _matrix_f16(
         context,
@@ -1311,8 +1373,17 @@ def _ffn(
     )
 
     token_rows = context.batch_size * _SQUARE_COUNT
-    hidden = _temporary_f16(context, element_count=token_rows * hidden_width)
-    if _CUTLASS_FFN1:
+    if "ffn_in" in sites and body_codes is None:
+        message = f"{prefix}: ffn_in is int8 but ln1 wrote no int8 copy"
+        raise ValueError(message)
+    mid_int8 = "ffn_mid" in sites
+    hidden = (_q1_codes(context, token_rows * hidden_width) if mid_int8 and "ffn_in" in sites
+              else _temporary_f16(context, element_count=token_rows * hidden_width))
+    if "ffn_in" in sites:
+        _q1_gemm(context, hidden, body_codes, prefix, "ffn_in", token_rows, hidden_width, body_width,
+                 epilogue="mish", output_format="i8" if mid_int8 else "f16",
+                 prescale=_q1_vector(context, prefix, "ffn_mid", "r", hidden_width) if mid_int8 else None)
+    elif _CUTLASS_FFN1:
         cutlass_matmul(
             context.builder,
             context.kernels,
@@ -1347,7 +1418,22 @@ def _ffn(
             bias=dense1_bias,
         )
     branch = _temporary_f16(context, element_count=token_rows * body_width)
-    if _CUTLASS_FFN2:
+    if mid_int8:
+        hidden_codes = hidden
+        if "ffn_in" not in sites:
+            hidden_codes = _q1_codes(context, token_rows * hidden_width)
+            quantise_operand(
+                context.builder,
+                context.kernels,
+                hidden_codes,
+                hidden,
+                _q1_vector(context, prefix, "ffn_mid", "r", hidden_width),
+                None,
+                QuantiseOperandSpecialization(token_rows, hidden_width, context.architecture),
+            )
+        _q1_gemm(context, branch, hidden_codes, prefix, "ffn_mid", token_rows, body_width, hidden_width,
+                 epilogue="residual", skip=body)
+    elif _CUTLASS_FFN2:
         cutlass_matmul(
             context.builder,
             context.kernels,
@@ -1386,24 +1472,8 @@ def _ffn(
             alpha=alpha,
         )
     output = _temporary_f16(context, element_count=token_rows * body_width)
-    layer_norm(
-        context.builder,
-        context.kernels,
-        output,
-        branch,
-        None,
-        gammas,
-        betas,
-        LayerNormSpecialization(
-            row_count=token_rows,
-            width=body_width,
-            activation="none",
-            has_skip=False,
-            has_bias=False,
-            architecture=context.architecture,
-        ),
-    )
-    return output
+    codes = _q1_norm(context, output, branch, gammas, betas, token_rows, body_width, next_attn_in, "attn_in")
+    return output, codes
 
 
 def _policy_head(
@@ -1653,17 +1723,20 @@ def _dense_output_head(  # noqa: PLR0913
         name=f"{prefix}/dense1/add/w",
         path=f"{path}.{'ip1_val_b' if prefix == '/value' else 'ip1_mov_b'}",
     )
+    # B3: an int8 artifact with D1 reads the analyser's refit of the value layer under its own names, so the FP16
+    # twin loading the same carrier keeps the trained layer (`_q1.D1_TARGETS`).
+    value_d1 = prefix == "/value" and any(context.q1_sites.values()) and _q1.d1_enabled()
     result_weights, _ = _matrix_f16(
         context,
         dense2_weight,
         input_width=hidden_width,
-        name=f"{prefix}/dense2/matmul/w",
+        name=_q1.d1_name(f"{prefix}/dense2/matmul/w") if value_d1 else f"{prefix}/dense2/matmul/w",
         path=f"{path}.{'ip2_val_w' if prefix == '/value' else 'ip2_mov_w'}",
     )
     result_bias = _vector_f16(
         context,
         dense2_bias,
-        name=f"{prefix}/dense2/add/w",
+        name=_q1.d1_name(f"{prefix}/dense2/add/w") if value_d1 else f"{prefix}/dense2/add/w",
         path=f"{path}.{'ip2_val_b' if prefix == '/value' else 'ip2_mov_b'}",
     )
     output = context.builder.buffer(
@@ -1814,6 +1887,122 @@ def _matrix_f16(
         ),
         output_width,
     )
+
+
+def _q1_plan(weights: net_pb2.Weights) -> dict[int, frozenset[str]]:
+    """B3: every encoder's int8 sites from the analyser's file (LC0EX_QUANT_GEMM=int8), or none (the FP16 build)."""
+    blocks = len(weights.encoder)
+    if blocks == 0:
+        return {}
+    d_model = len(weights.encoder[0].ln1_gammas.params) // _F16_SIZE_BYTES
+    hidden = len(weights.encoder[0].ffn.dense1_b.params) // _F16_SIZE_BYTES
+    vectors = _q1.load_vectors(blocks=blocks, d_model=d_model, hidden=hidden)
+    plan = dict(_q1.check_blocks(vectors, blocks))
+    if vectors is not None:
+        served = sum(len(sites) for sites in plan.values())
+        _LOGGER.info("B3: %d int8 sites of %d from %s (%s), D1 %s", served, 4 * blocks, vectors.path.name,
+                     vectors.digest, "on" if _q1.d1_enabled() else "off")
+        for index, sites in plan.items():
+            if len(sites) < len(_q1.site_widths(d_model, hidden)):
+                _LOGGER.info("B3: encoder %d keeps %s in FP16", index,
+                             sorted(set(_q1.site_widths(d_model, hidden)) - sites))
+    return plan
+
+
+def _q1_vector(context: _BuildContext, prefix: str, site: str, kind: str, width: int) -> Buffer:
+    """One FP32 vector of an int8 site (`scale`, `bias`: its output width; `r`: its input width)."""
+    return context.builder.persistent_buffer(
+        name=_q1.site_names(prefix, site)[kind],
+        shape=(width,),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
+        alignment_bytes=256,
+    )
+
+
+def _q1_codes(context: _BuildContext, element_count: int) -> Buffer:
+    """An int8 operand temporary (one byte per element)."""
+    return context.builder.temporary_buffer(size_bytes=element_count, alignment_bytes=256)
+
+
+def _q1_gemm(  # noqa: PLR0913
+    context: _BuildContext,
+    output: Buffer,
+    codes: Buffer,
+    prefix: str,
+    site: str,
+    rows: int,
+    n: int,
+    k: int,
+    *,
+    epilogue: str,
+    output_format: str = "f16",
+    skip: Buffer | None = None,
+    prescale: Buffer | None = None,
+) -> None:
+    """One int8 GEMM site: `[rows, k]` codes x the carrier's int8 `[n, k]` weights, the epilogue's FP32 vectors."""
+    names = _q1.site_names(prefix, site)
+    weights = context.builder.persistent_buffer(
+        name=names["w"],
+        shape=(n, k),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_U8,
+        alignment_bytes=256,
+    )
+    cutlass_gemm_i8(
+        context.builder,
+        context.kernels,
+        output,
+        codes,
+        weights,
+        _q1_vector(context, prefix, site, "scale", n),
+        _q1_vector(context, prefix, site, "bias", n),
+        CutlassGemmI8Specialization(rows, n, k, context.architecture, epilogue=epilogue, output=output_format),
+        skip=skip,
+        prescale=prescale,
+    )
+
+
+def _q1_norm(  # noqa: PLR0913
+    context: _BuildContext,
+    output: Buffer,
+    source: Buffer,
+    gammas: Buffer,
+    betas: Buffer,
+    rows: int,
+    width: int,
+    consumer: str | None,
+    site: str,
+) -> Buffer | None:
+    """A post-norm; with `consumer` (the encoder whose `site` reads it) it also writes that site's int8 copy.
+
+    The copy converts the norm's own FP32 row through the site's `r` (no offset: the analyser's BT4 files carry no
+    `m`), so the FP16 stream is bit-identical to the plain norm's.
+    """
+    codes = _q1_codes(context, rows * width) if consumer is not None else None
+    prescale = _q1_vector(context, consumer, site, "r", width) if consumer is not None else None
+    layer_norm(
+        context.builder,
+        context.kernels,
+        output,
+        source,
+        None,
+        gammas,
+        betas,
+        LayerNormSpecialization(
+            row_count=rows,
+            width=width,
+            activation="none",
+            has_skip=False,
+            has_bias=False,
+            architecture=context.architecture,
+            quantise="int8" if consumer is not None else "",
+            # The FP16 norms keep the spec's default, so an FP16 build compiles exactly the kernels it did before B3.
+            quant_offset=consumer is None,
+        ),
+        quant_output=codes,
+        quant_prescale=prescale,
+        quant_offset=prescale,
+    )
+    return codes
 
 
 def _temporary_f16(

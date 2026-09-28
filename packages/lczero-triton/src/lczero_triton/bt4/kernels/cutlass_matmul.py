@@ -785,23 +785,42 @@ int main() {{
     std::printf("-1\n");
     return 0;
   }}
+  // Timed as lc0ex serves: 200 launches captured in ONE CUDA graph, the best of 5 replays (a plain-stream loop rounds
+  // every kernel period up to a multiple of 2.048 us on some sm_120 drivers; backend sm_120 report 09-28 §3).
+  cudaStream_t stream;
+  cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+  cudaGraph_t graph;
+  cudaGraphExec_t exec;
+  cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+  for (int i = 0; i < 200; ++i) {{
+    {entry}<<<grid, block, shared_bytes, stream>>>({sweep_arguments});
+  }}
+  cudaStreamEndCapture(stream, &graph);
+  if (cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {{
+    std::printf("-1\n");
+    return 0;
+  }}
+  cudaGraphLaunch(exec, stream);
+  cudaStreamSynchronize(stream);
   cudaEvent_t start;
   cudaEvent_t stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
-  cudaEventRecord(start);
-  for (int i = 0; i < 200; ++i) {{
-    {entry}<<<grid, block, shared_bytes>>>({sweep_arguments});
+  float best = 1e30f;
+  for (int replay = 0; replay < 5; ++replay) {{
+    cudaEventRecord(start, stream);
+    cudaGraphLaunch(exec, stream);
+    cudaEventRecord(stop, stream);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0.f;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    best = milliseconds < best ? milliseconds : best;
   }}
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
   if (cudaGetLastError() != cudaSuccess) {{
     std::printf("-1\n");
     return 0;
   }}
-  float milliseconds = 0.f;
-  cudaEventElapsedTime(&milliseconds, start, stop);
-  std::printf("%f\n", milliseconds * 1000.f / 200.f);
+  std::printf("%f\n", best * 1000.f / 200.f);
   return 0;
 }}
 """

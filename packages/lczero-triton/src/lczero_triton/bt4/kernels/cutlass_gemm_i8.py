@@ -26,6 +26,9 @@ Three epilogues:
   lab's `ffn_softcap` is applied in the epilogue and the hidden is written as int8 through the `ffn_mid` vector
   (`output="i8"`) -- the "for free" epilogue of the 09-22 report -- or as FP16 (`output="f16"`, a test route).
   Round 25's G2 (interleaved columns) is therefore this family, not a separate kernel.
+* `mish`     -- BT4's FFN1 (B3, 09-28): `mish(acc * scale + bias)`, LC0's Mish transcribed exactly as the FP16 CUTLASS
+  epilogue has it (`cutlass_matmul`'s `lc0act::mish`: the `__expf` / `__fdividef` pair), written as FP16 (a layer whose
+  `ffn_mid` stays FP16) or as int8 codes through the `ffn_mid` vector (`output="i8"`), eight codes in one 64-bit store.
 
 Rounding of every int8 this module writes: `floor(x * r + 0.5)` clamped to +-127 -- the same rule the norm's
 conversion uses (`layer_norm`, `quantise_operand`), so one artifact has one rounding rule. It differs from
@@ -33,9 +36,11 @@ round-half-to-even only on exact ties.
 """
 
 import logging
+import math
 import os
 import subprocess
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -57,7 +62,7 @@ from lczero_triton.bt4.kernels.cutlass_matmul import (
 _LOGGER = logging.getLogger(__name__)
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
 _WARP_SIZE = 32
-EPILOGUES = ("bias", "residual", "glu")
+EPILOGUES = ("bias", "residual", "glu", "mish")
 OUTPUTS = ("f16", "i8")
 # int8 tensor-op GEMMs need 16-element (128-bit) rows on both operands.
 I8_ALIGNMENT = 16
@@ -102,8 +107,8 @@ class CutlassGemmI8Specialization:
         if self.output not in OUTPUTS:
             message = f"CutlassGemmI8Specialization.output={self.output!r}; expected one of {OUTPUTS}"
             raise ValueError(message)
-        if self.output == "i8" and self.epilogue != "glu":
-            message = "an int8 output is served by the glu epilogue only (the FFN hidden feeding ffn_mid)"
+        if self.output == "i8" and self.epilogue not in ("glu", "mish"):
+            message = "an int8 output is served by the glu and mish epilogues only (the FFN hidden feeding ffn_mid)"
             raise ValueError(message)
         if self.glu_softcap and self.epilogue != "glu":
             message = "glu_softcap needs epilogue='glu'"
@@ -167,6 +172,14 @@ _TYPES_TEMPLATE = """\
 #endif
 
 namespace {{
+
+// LC0's Mish, as `cutlass_matmul`'s `lc0act::mish` (the FP16 FFN1 epilogue this int8 site replaces).
+CUTLASS_HOST_DEVICE float lc0_mish(float x) {{
+  const float e = LC0_EXP(x);
+  const float n = e * e + 2.0f * e;
+  const float d = LC0_DIV(x, n + 2.0f);
+  return x <= -0.6f ? n * d : x - 2.0f * d;
+}}
 
 using ElementA = int8_t;
 using ElementB = int8_t;
@@ -326,6 +339,26 @@ _VISIT_GLU_I8 = """    const float4 r = *reinterpret_cast<const float4*>(prescal
     }
     *reinterpret_cast<uint32_t*>(output_ + static_cast<int64_t>(row) * kOutputColumns + hidden) = word;"""
 
+# BT4's FFN1 (B3): Mish on the eight columns, then FP16 out (one 128-bit store) or the ffn_mid codes (one 64-bit store,
+# the norm's rounding rule).
+_VISIT_MISH_F16 = """    cutlass::Array<cutlass::half_t, 8> packed;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < 8; ++i) packed[i] = cutlass::half_t(lc0_mish(value[i]));
+    *reinterpret_cast<uint4*>(output_ + static_cast<int64_t>(row) * kOutputColumns + column) =
+        *reinterpret_cast<uint4 const*>(&packed);"""
+
+_VISIT_MISH_I8 = """    const float4 r0 = *reinterpret_cast<const float4*>(prescale_ + column);
+    const float4 r1 = *reinterpret_cast<const float4*>(prescale_ + column + 4);
+    const float rs[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
+    uint32_t words[2] = {0u, 0u};
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < 8; ++i) {
+      const float code = fminf(fmaxf(floorf(fmaf(lc0_mish(value[i]), rs[i], 0.5f)), -127.0f), 127.0f);
+      words[i / 4] |= (static_cast<uint32_t>(static_cast<int32_t>(code)) & 0xffu) << (8 * (i % 4));
+    }
+    *reinterpret_cast<uint2*>(output_ + static_cast<int64_t>(row) * kOutputColumns + column) =
+        make_uint2(words[0], words[1]);"""
+
 # `cutlass_matmul`'s GLU softcap helpers, verbatim in form: c * tanh(x / c) two-sided, and the series for a
 # sigmoid gate in (0, 1) at c >= 8 -- the same fidelity class as the FP16 route this replaces.
 _GLU_SOFTCAP_DECL = """constexpr float kGluSoftcap = {cap!r}f;
@@ -419,20 +452,40 @@ int main() {{
     std::printf("-1\n");
     return 0;
   }}
+  // Timed as lc0ex serves: 200 launches captured in ONE CUDA graph, the best of 5 replays. A plain-stream loop rounds
+  // every kernel period up to a multiple of 2.048 us on some sm_120 drivers (RTX 5090, 590.48), which turned this
+  // sweep's picks into coin flips between tied candidates (backend sm_120 report 09-28 §3).
+  cudaStream_t stream;
+  cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+  cudaGraph_t graph;
+  cudaGraphExec_t exec;
+  cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+  for (int i = 0; i < 200; ++i) {entry}<<<grid, block, shared_bytes, stream>>>({sweep_arguments});
+  cudaStreamEndCapture(stream, &graph);
+  if (cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {{
+    std::printf("-1\n");
+    return 0;
+  }}
+  cudaGraphLaunch(exec, stream);
+  cudaStreamSynchronize(stream);
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
-  cudaEventRecord(start);
-  for (int i = 0; i < 200; ++i) {entry}<<<grid, block, shared_bytes>>>({sweep_arguments});
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
+  float best = 1e30f;
+  for (int replay = 0; replay < 5; ++replay) {{
+    cudaEventRecord(start, stream);
+    cudaGraphLaunch(exec, stream);
+    cudaEventRecord(stop, stream);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0.f;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    best = milliseconds < best ? milliseconds : best;
+  }}
   if (cudaGetLastError() != cudaSuccess) {{
     std::printf("-1\n");
     return 0;
   }}
-  float milliseconds = 0.f;
-  cudaEventElapsedTime(&milliseconds, start, stop);
-  std::printf("%f\n", milliseconds * 1000.f / 200.f);
+  std::printf("%f\n", best * 1000.f / 200.f);
   return 0;
 }}
 """
@@ -457,6 +510,8 @@ def _visit_body(specialization: CutlassGemmI8Specialization) -> str:
         return _VISIT_BIAS
     if specialization.epilogue == "residual":
         return _VISIT_RESIDUAL
+    if specialization.epilogue == "mish":
+        return _VISIT_MISH_I8 if specialization.output == "i8" else _VISIT_MISH_F16
     fields = _glu_fields(specialization)
     head = _VISIT_GLU_HEAD.replace("{gate_expr}", fields["gate_expr"]).replace("{up_expr}", fields["up_expr"])
     return head + "\n" + (_VISIT_GLU_I8 if specialization.output == "i8" else _VISIT_GLU_F16)
@@ -537,31 +592,76 @@ def select_tile(specialization: CutlassGemmI8Specialization) -> Tile:
     if cached is not None:
         threadblock, warp, stages = cached
         tile: Tile = (tuple(threadblock), tuple(warp), stages)  # type: ignore[assignment]
+    elif os.environ.get("LC0EX_CUTLASS_TILE_REUSE") == "1" and (nearest := _nearest_cached(specialization)) is not None:
+        # B3: as the FP16 path does (`cutlass_matmul._nearest_cached_tile`), an unswept rung borrows the nearest swept
+        # rung's tile (same device, gemm_n, k and epilogue family; nearest in log-M) and says so -- it is not a
+        # measurement of this shape. A dense ladder sweeps its key rungs first, then reuses.
+        tile, donor_m = nearest
+        _LOGGER.info("reusing the int8 tile measured at m=%d for m=%d n=%d k=%d (%s): %s", donor_m,
+                     specialization.m, specialization.gemm_n, specialization.k, specialization.family, tile)
     else:
         tile = _sweep(specialization, key)
     _MEMO[(specialization.m, specialization.gemm_n, specialization.k, specialization.family)] = tile
     return tile
 
 
-def _time_candidate(specialization: CutlassGemmI8Specialization, tile: Tile,
-                    include_directories: Sequence[Path | str]) -> float:
-    source = _render(_KERNEL_TEMPLATE + _SWEEP_MAIN, specialization, tile)
-    with TemporaryDirectory(prefix="lc0ex-i8-sweep-") as directory:
-        source_path = Path(directory) / "sweep.cu"
-        binary_path = Path(directory) / "sweep"
-        source_path.write_text(source, encoding="utf-8")
-        command = [str(_NVCC), "-std=c++17", "-O3", "--expt-relaxed-constexpr", "-w",
-                   f"-arch=sm_{specialization.architecture}"]
-        for include in include_directories:
-            command.extend(("-I", str(include)))
-        command.extend((str(source_path), "-o", str(binary_path)))
-        if subprocess.run(command, check=False, capture_output=True).returncode:  # noqa: S603
-            return -1.0
-        completed = subprocess.run([str(binary_path)], check=False, capture_output=True, text=True)  # noqa: S603
+def _nearest_cached(specialization: CutlassGemmI8Specialization) -> tuple[Tile, int] | None:
+    """The nearest swept rung's int8 tile for the same device, `gemm_n`, `k` and family, and its M (log-M distance)."""
+    from lczero_triton.bt4.kernels.cutlass_matmul import _load_sweep_cache  # noqa: PLC0415
+
+    architecture, multiprocessors = device_key()
+    prefix = f"{architecture}/{multiprocessors}/"
+    suffix = f"/{specialization.gemm_n}/{specialization.k}/{specialization.family}"
+    best: tuple[float, int, list[object]] | None = None
+    for key, tile in _load_sweep_cache().items():
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        try:
+            donor_m = int(key[len(prefix):].split("/", 1)[0])
+        except ValueError:
+            continue
+        if donor_m <= 0:
+            continue
+        distance = abs(math.log(donor_m / specialization.m))
+        if best is None or distance < best[0]:
+            best = (distance, donor_m, tile)
+    if best is None:
+        return None
+    threadblock, warp, stages = best[2]  # type: ignore[misc]
+    return (tuple(threadblock), tuple(warp), stages), best[1]  # type: ignore[return-value]
+
+
+def _compile_candidate(specialization: CutlassGemmI8Specialization, tile: Tile, directory: Path,
+                       include_directories: Sequence[Path | str]) -> Path | None:
+    """Build one candidate's timing binary in `directory`; None if it does not compile."""
+    source_path = directory / "sweep.cu"
+    binary_path = directory / "sweep"
+    source_path.write_text(_render(_KERNEL_TEMPLATE + _SWEEP_MAIN, specialization, tile), encoding="utf-8")
+    command = [str(_NVCC), "-std=c++17", "-O3", "--expt-relaxed-constexpr", "-w",
+               f"-arch=sm_{specialization.architecture}"]
+    for include in include_directories:
+        command.extend(("-I", str(include)))
+    command.extend((str(source_path), "-o", str(binary_path)))
+    if subprocess.run(command, check=False, capture_output=True).returncode:  # noqa: S603
+        return None
+    return binary_path
+
+
+def _run_candidate(binary_path: Path | None) -> float:
+    """Time one compiled candidate (its own CUDA-graph loop); -1 if it did not build or run."""
+    if binary_path is None:
+        return -1.0
+    completed = subprocess.run([str(binary_path)], check=False, capture_output=True, text=True)  # noqa: S603
     try:
         return float(completed.stdout.strip())
     except ValueError:
         return -1.0
+
+
+def _time_candidate(specialization: CutlassGemmI8Specialization, tile: Tile,
+                    include_directories: Sequence[Path | str]) -> float:
+    with TemporaryDirectory(prefix="lc0ex-i8-sweep-") as directory:
+        return _run_candidate(_compile_candidate(specialization, tile, Path(directory), include_directories))
 
 
 def _sweep(specialization: CutlassGemmI8Specialization, key: str,
@@ -570,16 +670,25 @@ def _sweep(specialization: CutlassGemmI8Specialization, key: str,
     _LOGGER.info("sweeping int8 CUTLASS tiles at m=%d n=%d k=%d (%s)", specialization.m, specialization.gemm_n,
                  specialization.k, specialization.family)
     best: tuple[float, Tile] | None = None
-    for candidate in _SWEEP_CANDIDATES:
-        (tile_m, tile_n, tile_k), _, stages = candidate
-        if (tile_m + tile_n) * tile_k * stages > limit:
-            continue
-        microseconds = _time_candidate(specialization, candidate, include_directories)
-        if microseconds <= 0.0:
-            continue
-        _LOGGER.info("  %s -> %.2f us", candidate, microseconds)
-        if best is None or microseconds < best[0]:
-            best = (microseconds, candidate)
+    candidates = [candidate for candidate in _SWEEP_CANDIDATES
+                  if (candidate[0][0] + candidate[0][1]) * candidate[0][2] * candidate[2] <= limit]
+    # B3: the candidates COMPILE in parallel (nvcc is the sweep's cost: ~30 s each) and are TIMED one after another,
+    # so no two timings share the card. The picks are the serial sweep's; the wall time is one compile, not nine.
+    with TemporaryDirectory(prefix="lc0ex-i8-sweep-") as root:
+        directories = [Path(root) / str(index) for index in range(len(candidates))]
+        for directory in directories:
+            directory.mkdir()
+        with ThreadPoolExecutor(max_workers=max(1, len(candidates))) as pool:
+            binaries = list(pool.map(lambda pair: _compile_candidate(specialization, pair[0], pair[1],
+                                                                     include_directories),
+                                     zip(candidates, directories, strict=True)))
+        for candidate, binary in zip(candidates, binaries, strict=True):
+            microseconds = _run_candidate(binary)
+            if microseconds <= 0.0:
+                continue
+            _LOGGER.info("  %s -> %.2f us", candidate, microseconds)
+            if best is None or microseconds < best[0]:
+                best = (microseconds, candidate)
     if best is None:
         message = f"no int8 tile compiled and ran for {key}"
         raise RuntimeError(message)
