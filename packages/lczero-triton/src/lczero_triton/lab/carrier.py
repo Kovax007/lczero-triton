@@ -285,6 +285,7 @@ def _quant_vector(plan: BufferPlan) -> torch.Tensor:
     from lczero_triton.lab._quant import loaded_prescale  # noqa: PLC0415
 
     scope, site, kind = plan.tensors
+    kind, _, padded = kind.partition(":")  # round 26b: `r:<padded>` -- the dff padded to CUTLASS's alignment
     loaded = loaded_prescale()
     if loaded is None:
         message = f"{plan.name}: no quantiser vectors were loaded; set LC0EX_QUANT_PRESCALE before planning"
@@ -295,7 +296,11 @@ def _quant_vector(plan: BufferPlan) -> torch.Tensor:
         raise CarrierError(message)
     if kind == "m":
         return torch.tensor(vectors.offset or (0.0,) * vectors.channels, dtype=torch.float32)
-    return torch.tensor(vectors.prescale, dtype=torch.float32)
+    values = torch.tensor(vectors.prescale, dtype=torch.float32)
+    if padded:
+        # The padded hidden channels are always 0 (all-zero GLU pairs); any positive r keeps them 0.
+        values = torch.cat((values, torch.ones(int(padded) - values.numel(), dtype=torch.float32)))
+    return values
 
 
 # One site's folded int8 weights and scale, computed once for its two plans (`/w` and `/scale`).
@@ -303,15 +308,26 @@ _INT8_SITES: dict[tuple[str, ...], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _site_matrix(graph: Graph, layout: str, weights: tuple[str, ...]) -> torch.Tensor:
-    """The site's float64 `[k, n]` weight in the GEMM's column order: concatenated, or gate/up interleaved pairs."""
+    """The site's float64 `[k, n]` weight in the GEMM's column order: concatenated, or gate/up interleaved pairs.
+
+    Round 26b: `<layout>:<padded>` zero-pads the FFN hidden axis to `padded` -- the pairs' axis of `glu_pairs`
+    (all-zero pairs), the input rows of FFN2's `concat`.
+    """
+    layout, _, padded = layout.partition(":")
     matrices = [_as_float32(graph, name).double() for name in weights]
     rows = graph.initializers[weights[0]].dims[0]
     matrices = [matrix.reshape(rows, -1) for matrix in matrices]
     if layout == "concat":
-        return torch.cat(matrices, dim=1)
+        matrix = torch.cat(matrices, dim=1)
+        if padded:
+            matrix = torch.cat((matrix, torch.zeros(int(padded) - rows, matrix.shape[1], dtype=matrix.dtype)))
+        return matrix
     if layout == "glu_pairs":
         gate, up = matrices
-        return torch.stack((gate, up), dim=2).reshape(rows, -1)
+        pairs = torch.stack((gate, up), dim=2)
+        if padded:
+            pairs = torch.cat((pairs, torch.zeros(rows, int(padded) - pairs.shape[1], 2, dtype=pairs.dtype)), dim=1)
+        return pairs.reshape(rows, -1)
     message = f"unknown int8 site layout {layout!r}"
     raise CarrierError(message)
 
@@ -347,6 +363,9 @@ def _int8_site(graph: Graph, plan: BufferPlan) -> tuple[torch.Tensor, torch.Tens
         raise CarrierError(message)
     matrix = _site_matrix(graph, layout, tuple(weights))
     smoothing = torch.tensor(vectors.smoothing or (), dtype=torch.float64)
+    if 0 < smoothing.numel() < matrix.shape[0] and ":" in layout:
+        # Round 26b: FFN2's zero-padded input rows take s = 1 (their weights are zero, their codes stay zero).
+        smoothing = torch.cat((smoothing, torch.ones(matrix.shape[0] - smoothing.numel(), dtype=torch.float64)))
     if smoothing.numel() != matrix.shape[0]:
         message = f"{plan.name}: 's' has {smoothing.numel()} channels, the weight's input axis {matrix.shape[0]}"
         raise CarrierError(message)
@@ -362,12 +381,16 @@ def _int8_site(graph: Graph, plan: BufferPlan) -> tuple[torch.Tensor, torch.Tens
 def _int8_bias(graph: Graph, plan: BufferPlan) -> torch.Tensor:
     """Q1: a site's bias in its GEMM's column order, times the residual alpha where the site has one."""
     layout, alpha, *biases = plan.tensors
+    layout, _, padded = layout.partition(":")  # round 26b: only the GLU pairs' bias is padded (FFN2's is over d_model)
     vectors = [_as_float32(graph, name).double() for name in biases]
     if layout == "concat":
         bias = torch.cat(vectors)
     elif layout == "glu_pairs":
         up = vectors[0]  # the gate projection has no bias: its half of every pair is zero
-        bias = torch.stack((torch.zeros_like(up), up), dim=1).reshape(-1)
+        pairs = torch.stack((torch.zeros_like(up), up), dim=1)
+        if padded:
+            pairs = torch.cat((pairs, torch.zeros(int(padded) - pairs.shape[0], 2, dtype=pairs.dtype)))
+        bias = pairs.reshape(-1)
     else:
         message = f"unknown int8 site layout {layout!r}"
         raise CarrierError(message)

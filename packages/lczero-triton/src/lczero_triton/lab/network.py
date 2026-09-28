@@ -158,6 +158,14 @@ _QUANT_ATTN_OUT = os.environ.get("LC0EX_QUANT_ATTN_OUT", "epilogue")
 if _QUANT_ATTN_OUT not in ("epilogue", "pass"):
     message = f"LC0EX_QUANT_ATTN_OUT={_QUANT_ATTN_OUT!r}; expected epilogue or pass"
     raise ValueError(message)
+# Round 26b CONTROLS, never served: a build that must FAIL the reference gate, so a pass is evidence. `LC0EX_OGATE_SCALE_CONTROL`
+# replaces the export's output-gate scale (2.0) on the EGT2 blocks; `LC0EX_FINAL_NORM_CONTROL=skip` drops a pre-norm
+# EGT2 tower's final norm. Unset = the export's graph.
+_OGATE_SCALE_CONTROL = os.environ.get("LC0EX_OGATE_SCALE_CONTROL", "")
+_FINAL_NORM_CONTROL = os.environ.get("LC0EX_FINAL_NORM_CONTROL", "")
+if _FINAL_NORM_CONTROL not in ("", "skip"):
+    message = f"LC0EX_FINAL_NORM_CONTROL={_FINAL_NORM_CONTROL!r}; expected unset or skip"
+    raise ValueError(message)
 # Round 26 C2: the edge site FFN's maps -- "ieee" (K3's FP32 class, default) or "fp16" (tensor cores, FP32 accumulate).
 _SITE_DOT = os.environ.get("LC0EX_SITE_DOT", "ieee")
 if _SITE_DOT not in ("ieee", "fp16"):
@@ -831,6 +839,10 @@ def _check_egt_supported(lab: LabNetwork) -> None:
     if any(block.smolgen is not None for block in lab.blocks):
         message = "EGT2 export with smolgen blocks: `attention_egt` has no smolgen term"
         raise NotImplementedError(message)
+    if lab.architecture.output_gate and output_gate_form() != "packed":
+        message = ("EGT2 export with the attention output gate: `attention_egt` reads it as the packed projection's "
+                   "fourth lane only (LC0EX_OGATE_FORM=packed)")
+        raise NotImplementedError(message)
     shape = lab.architecture
     if lab.pair is None:
         message = "EGT2 export without a pair stream: the logit assembly reads S and the folded pair tables"
@@ -1007,6 +1019,11 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
             written += 1
             if copy is not None:
                 write_copy(context.builder, context.kernels, copy, state[current], copy_specialization(written))
+    if lab.final_norm is not None and _FINAL_NORM_CONTROL != "skip":
+        # O: the pre-norm tower is normed once, here, before every head (as `_network`).
+        normed = context.temporary(context.rows * shape.d_model)
+        _norm(context, normed, body, "/encoder/final_norm", shape.d_model, "none")
+        body = normed
     _policy_head(context, lab, body, edges, edge_norm)
     _dense_head(context, body, "/value", hidden_width=128, square_width=128, output_name="/output/wdl",
                 output_width=3, final_activation="none")
@@ -1022,16 +1039,27 @@ def _encoder_egt(  # noqa: PLR0913
     """One EGT2 encoder block: packed QKV, `attention_egt`, then the static residual branch, LN1, GLU FFN, LN2.
 
     `edge_state` is what the head program reads in the "f32" and "f16" modes; `state` is the FP32 state the
-    "tiles" mode builds its read tiles from.
+    "tiles" mode builds its read tiles from. O (round 26b): a pre-norm export norms inside the branches (LN1 feeds
+    the projections, LN2 the FFN, the stream is never normed here), and the attention output gate rides the packed
+    projection as a fourth lane, `[q | k | v | g]`, applied by `attention_egt` before its store.
     """
     prefix = encoder_prefix(index)
     shape = lab.architecture
     assert lab.egt is not None  # noqa: S101 - `build` checked it
     edge = lab.egt.blocks[index]
+    block = lab.blocks[index]
     rows, width = context.rows, shape.d_model
-    # P3: one packed projection, [q | k | v] per row, read in place by attention_egt.
-    qkv = context.temporary(rows * 3 * width)
+    prenorm = shape.block_style == "prenorm"
+    gated = block.gate_weight is not None
+    lanes = 4 if gated else 3
     int8 = index in context.int8_blocks
+    source = body
+    if prenorm:
+        # O: LN1 feeds only the projections. Q1 (round 26b): in an int8 block its int8 copy is what they read.
+        source = context.temporary(rows * width)
+        body_codes = _norm(context, source, body, f"{prefix}/ln1", width, "none")
+    # P3: one packed projection, [q | k | v] per row (O: [q | k | v | g]), read in place by attention_egt.
+    qkv = context.temporary(rows * lanes * width)
     if int8 and body_codes is None:
         message = f"{prefix}: an int8 block without its producer's int8 copy (the attn_in norm did not quantise)"
         raise ValueError(message)
@@ -1041,10 +1069,11 @@ def _encoder_egt(  # noqa: PLR0913
         cutlass_gemm_i8(
             context.builder, context.kernels, qkv, body_codes, context.weight(f"{stems['attn_in']}/w"),
             context.weight(f"{stems['attn_in']}/scale"), context.weight(f"{stems['attn_in']}/bias"),
-            CutlassGemmI8Specialization(rows, 3 * width, width, context.architecture, epilogue="bias"),
+            CutlassGemmI8Specialization(rows, lanes * width, width, context.architecture, epilogue="bias"),
         )
     else:
-        _projection(context, qkv, body, f"{prefix}/mha/qkv", rows, 3 * width, width, use_cutlass=_CUTLASS_QKV)
+        _projection(context, qkv, source, f"{prefix}/mha/qkvg" if gated else f"{prefix}/mha/qkv", rows, lanes * width,
+                    width, use_cutlass=_CUTLASS_QKV)
     # Q1: an int8 block's attention writes the out-projection's operand directly (`attn_out` codes, one byte each),
     # unless the conversion is priced as a separate pass (LC0EX_QUANT_ATTN_OUT=pass).
     fused_codes = int8 and _QUANT_ATTN_OUT == "epilogue"
@@ -1056,6 +1085,8 @@ def _encoder_egt(  # noqa: PLR0913
         "batch_count": context.batch_size * shape.heads, "heads": shape.heads, "head_dim": shape.head_dim,
         "architecture": context.architecture, "cap": edge.cap, "export_h": export_h, "capacity": _EGT_CAPACITY,
         "overflow_exact": _EGT_OVERFLOW == "branch", "quant_output": fused_codes,
+        "output_gate": gated,
+        "gate_scale": (float(_OGATE_SCALE_CONTROL) if _OGATE_SCALE_CONTROL else block.gate_scale) if gated else 2.0,
     }
     if not reads:
         # r23b §7: this block does not read the edge stream. q.k and the four E terms stay; the edge read, door and
@@ -1118,6 +1149,16 @@ def _encoder_egt(  # noqa: PLR0913
     else:
         _skip_projection(context, branch, merged, f"{prefix}/mha/out", rows, width, width, skip=body,
                          alpha=context.weight(f"{prefix}/mha/alpha/w"), use_cutlass=_CUTLASS_OUTPROJ)
+    if prenorm:
+        # O: `branch` is the stream; LN2 feeds the GLU, FFN2 adds into the stream, nothing norms it here. Q1: in an
+        # int8 block LN2's int8 copy is the GLU's operand.
+        normed = context.temporary(rows * width)
+        ffn_codes = _norm(context, normed, branch, f"{prefix}/ln2", width, "none")
+        if int8 and ffn_codes is None:
+            message = f"{prefix}: a pre-norm int8 block whose ln2 wrote no int8 copy for ffn_in"
+            raise ValueError(message)
+        return _gated_ffn_branch(context, prefix, normed, skip=branch, width=width, hidden=shape.ffn_hidden,
+                                 codes=ffn_codes if int8 else None), None
     attended = context.temporary(rows * width)
     attended_codes = _norm(context, attended, branch, f"{prefix}/ln1", width, "none")
     if int8 and attended_codes is None:

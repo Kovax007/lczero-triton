@@ -259,15 +259,21 @@ def loaded_prescale() -> "QuantPrescale | None":
     return next(iter(_LOADED.values()), None)
 
 
-def producing_norm(scope: str, site: str) -> tuple[str, str] | None:
+def producing_norm(scope: str, site: str, *, style: str = "postnorm") -> tuple[str, str] | None:
     """Which norm emits this site's int8 copy, as `(buffer prefix, norm)` -- or None for a GEMM site.
 
-    ⚠ The off-by-one that would silently ruin a net: a block's ATTENTION input is the *previous* block's
-    `ln2` output (the embedding's `ln1` at block 0), while its FFN input is its own `ln1`. A vector
-    folded into the wrong norm still loads, still runs and still returns moves.
+    ⚠ The off-by-one that would silently ruin a net: under post-norm a block's ATTENTION input is the *previous*
+    block's `ln2` output (the embedding's `ln1` at block 0), while its FFN input is its own `ln1`. A vector
+    folded into the wrong norm still loads, still runs and still returns moves. Under pre-norm (round 26b) there
+    is no shift: a block's own `ln1` feeds its attention and its own `ln2` its FFN (`_names.quantised_norms`).
     """
     if site in FOLDS_INTO_EPILOGUE:
         return None
+    if style == "prenorm":
+        if scope == "embedding":
+            message = f"embedding/{site}: a pre-norm net's embedding feeds no quantised GEMM"
+            raise QuantFormatError(message)
+        return (encoder_prefix(int(scope[7:])), "ln1" if site == SITE_ATTN_IN else "ln2")
     if site == SITE_FFN_IN:
         return (EMBEDDING_PREFIX if scope == "embedding" else encoder_prefix(int(scope[7:])), "ln1")
     if scope == "embedding":

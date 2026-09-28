@@ -277,7 +277,7 @@ _WARPS = (2, 4, 8, 16)
     key=["batch_count", "heads", "head_dim", "capacity", "cap", "export_h", "export_weights", "use_qk", "use_attack",
          "use_key", "use_query", "use_scaled", "use_read", "use_door", "use_gate", "state_tiles", "round_heads",
          "head_base", "coefficient_vectors", "scaled_stream", "overflow_exact", "overflow_only",
-         "state_f8", "state_i8", "quant_output"],
+         "state_f8", "state_i8", "quant_output", "output_gate"],
     cache_results=True,
 )
 @triton.jit
@@ -332,12 +332,18 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
     state_scales: tl.constexpr = (),
     state_i8: tl.constexpr = False,
     quant_output: tl.constexpr = False,
+    output_gate: tl.constexpr = False,
+    gate_scale: tl.constexpr = 2.0,
 ) -> None:
     """One head's EGT2 attention block end to end.
 
     `quant_output` (Q1, round 26): the block's output is written as the out-projection's int8 operand -- the
     `attn_out` codes `floor(o_j * r_j + 0.5)` clamped to +-127, `r` = `quant_prescale` over the output channels --
     instead of FP16, so the conversion pass and the FP16 round trip of the attention output disappear.
+
+    `output_gate` (O on the EGT2 blocks, round 26b): `qkv` is the packed `[q | k | v | g]` (stride 4 width) and the
+    attended tile is multiplied by `gate_scale * sigmoid(g)` in FP32 before the store -- the attention OUTPUT gate
+    (`mha_output_gate`), not the edge door's per-head gate (`use_gate`).
     """
     program = tl.program_id(0)
     sample = program // round_heads
@@ -349,6 +355,8 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
     matrix = sample * heads + head  # the (sample, head) index of the H and A exports, whatever the round
     width = heads * head_dim
     stride = 3 * width
+    if output_gate:
+        stride = 4 * width
     squares = tl.arange(0, 64)
     depth = tl.arange(0, head_dim)
     direct = squares[:, None] * 64 + squares[None, :]
@@ -474,6 +482,11 @@ def _attention_egt_kernel(  # noqa: PLR0913, PLR0915, C901
 
     values = tl.load(qkv + row_base + 2 * width + squares[:, None] * stride + depth[None, :])
     attended = tl.dot(probabilities.to(values.dtype), values, input_precision="ieee", out_dtype=tl.float32)
+    if output_gate:
+        # O: `gate_scale * sigmoid(g)` per (square, channel) of this head, in FP32 on the FP32 accumulator, as
+        # `attention_static` does; the lab computes the gate in float32 because it multiplies the whole branch.
+        pre_activation = tl.load(qkv + row_base + 3 * width + squares[:, None] * stride + depth[None, :])
+        attended = attended * (gate_scale * tl.sigmoid(pre_activation.to(tl.float32)))
     destination = output + sample * 64 * width + squares[:, None] * width + head * head_dim + depth[None, :]
     if quant_output:
         # The same rule as every int8 the artifact writes (`layer_norm`, `quantise_operand`, `cutlass_gemm_i8`).
@@ -532,6 +545,9 @@ class AttentionEgtSpecialization:
     state_i8: bool = False
     # Q1 (round 26): the output is the out-projection's int8 operand, through the `attn_out` vector.
     quant_output: bool = False
+    # O (round 26b): the attention output gate as the fourth lane of the packed projection, `[q | k | v | g]`.
+    output_gate: bool = False
+    gate_scale: float = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -704,6 +720,8 @@ def launch_attention_egt(  # noqa: PLR0913
         state_scales=specialization.state_scales,
         state_i8=specialization.state_i8,
         quant_output=specialization.quant_output,
+        output_gate=specialization.output_gate,
+        gate_scale=specialization.gate_scale,
     )
 
 
@@ -757,7 +775,8 @@ def compile_attention_egt(specialization: AttentionEgtSpecialization) -> KernelA
         "door/w": zeros(heads, STATE_CHANNELS), "gate/w": zeros(heads, STATE_CHANNELS), "gate/b": zeros(heads),
     }
     compiled = launch_attention_egt(
-        output, zeros(samples, TOKENS, 3 * width, dtype=torch.float16), edge_list,
+        output, zeros(samples, TOKENS, (4 if specialization.output_gate else 3) * width, dtype=torch.float16),
+        edge_list,
         torch.zeros((samples, TOKENS, TOKENS), dtype=torch.uint64, device="cuda"),
         torch.ones((samples, TOKENS, TOKENS), dtype=norm_type, device="cuda"),
         torch.zeros((samples, round_heads_of(specialization), 3, TOKENS, TOKENS), dtype=state_type, device="cuda")

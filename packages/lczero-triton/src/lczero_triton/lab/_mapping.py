@@ -710,6 +710,11 @@ def _check_output_gate(graph: Graph, gate: _OutputGate, query: Node, output: Nod
     attention = _source_behind(graph, next(name for name in product.inputs if name != doubled))
     producer = graph.produced_by(attention)
     weights = graph.produced_by(producer.inputs[0]) if producer is not None and producer.op_type == "MatMul" else None
+    if weights is not None and weights.op_type == "Mul":
+        # Round 26b: an EGT2 block's weights are its Softmax times the edge door's gate, `Mul(Softmax, 2 sigmoid(.))`.
+        softmaxes = [node for name in weights.inputs
+                     if (node := graph.produced_by(name)) is not None and node.op_type == "Softmax"]
+        weights = softmaxes[0] if len(softmaxes) == 1 else weights
     _require(weights is not None and weights.op_type == "Softmax",
              f"{where}: the gate multiplies {attention}, which is not the attention weights' product with V")
 
@@ -1234,9 +1239,8 @@ def read_network(graph: Graph) -> LabNetwork:
     egt = egt_pair = None
     agreed: list[tuple[str, str]] = []
     if any(_is_door_softmax(graph, node) for node in graph.nodes):
-        if style != "postnorm":
-            message = f"an EGT2 export with {style} blocks; the edge stream is read around post-norm blocks only"
-            raise ArchitectureError(message)
+        # Round 26b: pre-norm EGT2 (P1 / P1g). The site walk needs only each block's end -- the FFN residual Add
+        # under pre-norm, LN2 under post-norm -- and its own range must stay clear of Gemms and norms either way.
         egt, egt_pair, ranges, exclusions, agreed = _read_egt(graph, ranges)
     blocks = tuple(
         _read_block(graph, start, end, exclude) for (start, end), exclude in zip(ranges, exclusions, strict=True)
@@ -2096,6 +2100,16 @@ def _board_transposed(graph: Graph, tensor: str) -> tuple[str, int] | None:
     return node.inputs[0], node.index
 
 
+def _shape_only(consumers: dict[str, list[Node]], node: Node) -> bool:
+    """True when every reader of `node` reads only its shape: a value-dead node the export kept for a `Shape`.
+
+    Round 26b: a pre-norm tower's tap norm at a site block (`tap_norms[b](x)`, for the lab's depth-attending aux
+    heads) survives the export only because its batch dimension sizes the readback's `Expand`; nothing reads its value.
+    """
+    readers = [reader for name in node.outputs for reader in consumers.get(name, [])]
+    return bool(readers) and all(reader.op_type == "Shape" for reader in readers)
+
+
 def _read_egt_site(  # noqa: C901, PLR0913
     graph: Graph, consumers: dict[str, list[Node]], add: Node, readback: _ChannelRead, after: int, block_end: int
 ) -> EgtSite:
@@ -2166,7 +2180,8 @@ def _read_egt_site(  # noqa: C901, PLR0913
     _require(len(epsilons) == 1, f"{where}: rms epsilons differ: {sorted(epsilons)}")
     first = block_end + 1
     _require(min(touched) >= first and max(touched) < last, f"{where}: its nodes are not between block {after} and e'")
-    intruders = [node.index for node in graph.nodes[first : last + 1] if node.op_type in ("Gemm", "LayerNormalization")]
+    intruders = [node.index for node in graph.nodes[first : last + 1]
+                 if node.op_type in ("Gemm", "LayerNormalization") and not _shape_only(consumers, node)]
     _require(not intruders, f"{where}: block nodes {intruders[:4]} inside the site's range")
     return EgtSite(
         after_block=after,

@@ -217,23 +217,25 @@ D1_NAMES = ("/value/dense2/w_d1", "/value/dense2/b_d1")
 def quantised_norms(architecture: "Architecture") -> tuple[tuple[str, str, str, str], ...]:
     """Every norm that emits an int8 copy: `(buffer prefix, norm, analyser scope, analyser site)`.
 
-    Post-norm only, and that is the whole ordering: the embedding's FFN norm feeds block 0's attention, each
-    block's `ln1` feeds its own FFN, and each block's `ln2` feeds the NEXT block's attention -- except the last,
-    whose output goes to the heads, which SPEC v2 never quantises. 28 + 27 + 1 = 56 on the flagship.
+    Post-norm: the embedding's FFN norm feeds block 0's attention, each block's `ln1` feeds its own FFN, and each
+    block's `ln2` feeds the NEXT block's attention -- except the last, whose output goes to the heads, which SPEC v2
+    never quantises. 28 + 27 + 1 = 56 on the flagship. Pre-norm (round 26b): a block's own `ln1` feeds its
+    attention and its own `ln2` its FFN, and nothing else reads either, so 2 per block and none in the embedding.
     """
     source = quant_prescale_source()
     if not source:
         return ()
-    if architecture.block_style != "postnorm":
-        message = (f"LC0EX_QUANT_PRESCALE with a {architecture.block_style} net: under pre-norm a norm feeds only "
-                   "its GEMM, so the copy replaces the FP16 output instead of joining it and the vector folds "
-                   "into the norm's own scale. That road is not built (ruling 09-22 ask 4).")
-        raise ValueError(message)
-    norms = [(EMBEDDING_PREFIX, "ln1", "encoder0", "attn_in")]
-    for index in range(architecture.blocks):
-        norms.append((encoder_prefix(index), "ln1", f"encoder{index}", "ffn_in"))
-        if index + 1 < architecture.blocks:
-            norms.append((encoder_prefix(index), "ln2", f"encoder{index + 1}", "attn_in"))
+    norms = []
+    if architecture.block_style == "prenorm":
+        for index in range(architecture.blocks):
+            norms.append((encoder_prefix(index), "ln1", f"encoder{index}", "attn_in"))
+            norms.append((encoder_prefix(index), "ln2", f"encoder{index}", "ffn_in"))
+    else:
+        norms.append((EMBEDDING_PREFIX, "ln1", "encoder0", "attn_in"))
+        for index in range(architecture.blocks):
+            norms.append((encoder_prefix(index), "ln1", f"encoder{index}", "ffn_in"))
+            if index + 1 < architecture.blocks:
+                norms.append((encoder_prefix(index), "ln2", f"encoder{index + 1}", "attn_in"))
     if source == QUANT_PROBE:
         return tuple(norms)
     from lczero_triton.lab._quant import prescale_for  # noqa: PLC0415  # a cycle otherwise: _quant reads this file.
@@ -303,33 +305,38 @@ def _plan_quant_gemm(network: LabNetwork) -> Iterator[BufferPlan]:
     served = int8_blocks(shape)
     if not served:
         return
-    if shape.block_style != "postnorm":
-        message = "LC0EX_QUANT_GEMM=int8 is built for the post-norm family (the flagship); pre-norm is ask 4"
-        raise ValueError(message)
     width, hidden = shape.d_model, shape.ffn_hidden
-    if padded_hidden(hidden) != hidden or hidden % 16 or width % 16:
-        message = f"int8 GEMM sites need d_model and dff multiples of 16; got {width} and {hidden}"
+    # Round 26b: a dff off CUTLASS's alignment (the 512 family's 683) is zero-padded as the FP16 plans pad it -- the
+    # padded GLU pairs are all-zero columns (sigmoid(0) * 0 = 0 -> code 0) and FFN2 reads them through zero rows.
+    # `:<padded>` on a layout (and on the `ffn_mid` vector) names that padding for the carrier.
+    padded = padded_hidden(hidden)
+    if padded % 16 or width % 16:
+        message = f"int8 GEMM sites need d_model and the padded dff multiples of 16; got {width} and {padded} (dff {hidden})"
         raise ValueError(message)
+    pad = f":{padded}" if padded != hidden else ""
     for index in sorted(served):
         block = network.blocks[index]
         prefix, scope = encoder_prefix(index), f"encoder{index}"
         stems, conversions = i8_site_names(prefix), i8_conversion_names(prefix)
+        # O (round 26b): the output gate reads what Q, K and V read, so it is the packed site's fourth lane here too.
+        gate = (block.gate_weight,) if block.gate_weight is not None else ()
+        gate_bias = (block.gate_bias,) if block.gate_bias is not None else ()
         yield from _plan_i8_site(stems["attn_in"], scope, "attn_in", "concat", "",
-                                 (block.query_weight, block.key_weight, block.value_weight),
-                                 (block.query_bias, block.key_bias, block.value_bias),
-                                 columns=3 * width, reduction=width)
+                                 (block.query_weight, block.key_weight, block.value_weight, *gate),
+                                 (block.query_bias, block.key_bias, block.value_bias, *gate_bias),
+                                 columns=(3 + len(gate)) * width, reduction=width)
         yield from _plan_i8_site(stems["attn_out"], scope, "attn_out", "concat", block.attention_alpha,
                                  (block.output_weight,), (block.output_bias,), columns=width, reduction=width)
         yield _plan(conversions["attn_out"], (width,), scope, "attn_out", "r", source="quant_vector",
                     data_type=FLOAT32)
         # The gate projection has no bias in this family (see `_plan_gated_ffn`): its half of the pairs is zero.
-        yield from _plan_i8_site(stems["ffn_in"], scope, "ffn_in", "glu_pairs", "",
+        yield from _plan_i8_site(stems["ffn_in"], scope, "ffn_in", "glu_pairs" + pad, "",
                                  (block.ffn_gate_weight, block.ffn_up_weight), (block.ffn_up_bias,),
-                                 columns=2 * hidden, reduction=width)
-        yield _plan(conversions["ffn_mid"], (hidden,), scope, "ffn_mid", "r", source="quant_vector",
+                                 columns=2 * padded, reduction=width)
+        yield _plan(conversions["ffn_mid"], (padded,), scope, "ffn_mid", "r" + pad, source="quant_vector",
                     data_type=FLOAT32)
-        yield from _plan_i8_site(stems["ffn_mid"], scope, "ffn_mid", "concat", block.ffn_alpha,
-                                 (block.ffn_down_weight,), (block.ffn_down_bias,), columns=width, reduction=hidden)
+        yield from _plan_i8_site(stems["ffn_mid"], scope, "ffn_mid", "concat" + pad, block.ffn_alpha,
+                                 (block.ffn_down_weight,), (block.ffn_down_bias,), columns=width, reduction=padded)
     if quant_d1_source():
         # FP16 like the layer it replaces (the same dense kernel reads it); FP16 rounds the refit's O(1e-3) moves
         # no worse than it rounds the trained layer.

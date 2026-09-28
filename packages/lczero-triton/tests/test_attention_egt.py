@@ -471,6 +471,69 @@ def test_quant_output_is_the_int8_of_the_fp16_output() -> None:
     assert saturated < 0.5  # the test must exercise the rounding, not only the clamp
 
 
+def test_output_gate_is_the_ungated_output_times_two_sigmoid() -> None:
+    """O on the EGT2 blocks (round 26b): with `output_gate` the kernel reads `[q | k | v | g]` (stride 4 width) and
+    stores `gate_scale * sigmoid(g) * o`, o being exactly what the ungated kernel computes from `[q | k | v]`.
+
+    Synthetic inputs, the kernel against itself: both runs share every logit and the FP32 accumulator, so the only
+    differences are the gate's FP32 product and the store's rounding -- within 2 FP16 ulps of |o|. The int8 store takes
+    the gated value too (Q1's `attn_out` codes of the gated branch).
+    """
+    torch.manual_seed(261)
+    count = 16
+    width = _HEADS * _DEPTH
+    bits = torch.randint(0, 2**31, (count, 64, 64), dtype=torch.int64) & torch.randint(0, 2**31, (count, 64, 64),
+                                                                                        dtype=torch.int64)
+    edges = bits.to(torch.uint64).cuda()
+    qkv = (0.5 * torch.randn(count, 64, 3 * width)).half().cuda()
+    gate = (1.5 * torch.randn(count, 64, width)).half().cuda()
+    qkvg = torch.cat([qkv, gate], dim=2).contiguous()
+    norm = (0.1 + torch.rand(count, 64, 64)).half().cuda()
+    state = torch.randn(count, 16, 64, 64).cuda()
+    tables = {"qk_scale": torch.full((_HEADS,), 0.25), "attack": 0.1 * torch.randn(_HEADS, 34),
+              "key": 0.1 * torch.randn(_HEADS, 34, _DEPTH), "query": 0.1 * torch.randn(_HEADS, 34, _DEPTH),
+              "scaled_coefficients": 0.1 * torch.randn(_HEADS, 34), "constant_bias": 0.1 * torch.randn(_HEADS, 64, 64),
+              "edge_read/w": 0.1 * torch.randn(_HEADS, 16), "door/w": 0.1 * torch.randn(_HEADS, 16),
+              "gate/w": 0.1 * torch.randn(_HEADS, 16), "gate/b": 0.1 * torch.randn(_HEADS)}
+    tables = {name: tensor.float().cuda() for name, tensor in tables.items()}
+    buffers = (torch.empty((count, _CAPACITY), dtype=torch.int16, device="cuda"),
+               torch.empty((count, _CAPACITY), dtype=torch.int8, device="cuda"),
+               torch.empty((count, 2, CELLS), dtype=torch.int16, device="cuda"),
+               torch.empty((count,), dtype=torch.int32, device="cuda"),
+               torch.empty((count, 64), dtype=torch.int32, device="cuda"),
+               torch.empty((count, 64), dtype=torch.int32, device="cuda"))
+    launch_egt_edge_list(*buffers, edges, _CAPACITY)
+    torch.cuda.synchronize()
+    common = {"batch_count": count * _HEADS, "heads": _HEADS, "head_dim": _DEPTH, "architecture": _architecture(),
+              "cap": True, "capacity": _CAPACITY}
+    plain = torch.empty((count, 64, width), dtype=torch.float16, device="cuda")
+    launch_attention_egt(plain, qkv, buffers[:4], edges, norm, state, tables, AttentionEgtSpecialization(**common))
+    gated = torch.empty((count, 64, width), dtype=torch.float16, device="cuda")
+    launch_attention_egt(gated, qkvg, buffers[:4], edges, norm, state, tables,
+                         AttentionEgtSpecialization(**common, output_gate=True, gate_scale=2.0))
+    prescale = (20.0 + 80.0 * torch.rand(width)).cuda()
+    codes = torch.full((count, 64, width), 99, dtype=torch.int8, device="cuda")
+    launch_attention_egt(codes, qkvg, buffers[:4], edges, norm, state, tables,
+                         AttentionEgtSpecialization(**common, output_gate=True, gate_scale=2.0, quant_output=True),
+                         quant_prescale=prescale)
+    torch.cuda.synchronize()
+    factor = 2.0 * torch.sigmoid(gate.float())
+    expected = plain.float() * factor
+    error = (gated.float() - expected).abs()
+    bound = 2.0 * 2.0**-10 * expected.abs() + 2.0**-24
+    ratio = float((error / bound).max())
+    changed = float(((gated.float() - plain.float()).abs() > 1e-3).float().mean())
+    codes_expected = torch.clamp(torch.floor(gated.float() * prescale + 0.5), -127, 127)
+    code_difference = (codes.float() - codes_expected).abs()
+    print(f"O attention_egt gate: max |err| / (2 ulp) {ratio:.3f}, outputs moved by the gate {changed:.3f}, "
+          f"int8 max |code diff| {float(code_difference.max()):.0f}, rate {float((code_difference > 0).float().mean()):.2e}",
+          flush=True)
+    assert ratio <= 1.0
+    assert changed > 0.5  # the gate must actually act: 2 sigmoid(g) spans (0.1, 1.9) at |g| ~ 1.5
+    assert float(code_difference.max()) <= 1.0
+    assert float((code_difference > 0).float().mean()) < 1e-2
+
+
 def test_compiles_to_lc0ex_artifacts() -> None:
     samples = 8
     specialization = AttentionEgtSpecialization(batch_count=samples * _HEADS, heads=_HEADS, head_dim=_DEPTH,
