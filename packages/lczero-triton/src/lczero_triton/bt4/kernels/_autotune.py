@@ -1,11 +1,32 @@
-"""Shared launch candidates for BT4 autotuning."""
+"""Shared launch candidates for BT4 autotuning, and how every candidate is timed.
 
+Timing (the standing rule of 09-28, `RULING_sm120_report_b3_int8_bt4_first_…_0928.md` §2): every autotune candidate is
+timed inside a CUDA graph, as lc0ex serves. A plain-stream loop rounds every kernel period up to a multiple of 2.048 us
+on some sm_120 drivers (RTX 5090, 590.48; the 4090 on 610 does not), which turns close candidates into coin flips.
+The cold semantics are kept: the default benchmarker flushes L2 before each call (as `triton.testing.do_bench` does)
+and `cold_do_bench` re-uploads the operands (as before); the graph measures `[prologue, call] x N` minus
+`[prologue] x N`. A call that cannot be captured falls back to the plain benchmarker, with a warning.
+`LC0EX_AUTOTUNE_TIMING=plain` restores the old timing for an A/B.
+"""
+
+import logging
+import os
 import weakref
+from collections.abc import Callable
 from typing import cast
 
 import torch
 import triton
 import triton.testing
+
+_LOGGER = logging.getLogger(__name__)
+_TIMING = os.environ.get("LC0EX_AUTOTUNE_TIMING", "graph")
+if _TIMING not in ("graph", "plain"):
+    message = f"LC0EX_AUTOTUNE_TIMING={_TIMING!r}; expected 'graph' or 'plain'"
+    raise ValueError(message)
+_GRAPH_CALLS = 10
+_GRAPH_REPLAYS = 5
+_UNCAPTURABLE: set[str] = set()
 
 _ELEMENTWISE_CONFIGURATIONS = (
     (64, 1),
@@ -113,6 +134,87 @@ def _summarize_timings(
     return sum(times) / len(times)
 
 
+def _graph_milliseconds(prologue: Callable[[], object], call: Callable[[], object], where: str) -> float | None:
+    """Milliseconds per `call`: `[prologue, call] x N` minus `[prologue] x N`, each one CUDA graph, best of 5 replays.
+
+    None when the call cannot be captured (the caller then times it the plain way).
+    """
+    stream = torch.cuda.Stream()
+    try:
+        call()  # compile and warm outside the capture
+        torch.cuda.synchronize()
+        graphs = []
+        for with_call in (True, False):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                for _ in range(_GRAPH_CALLS):
+                    prologue()
+                    if with_call:
+                        call()
+            graphs.append(graph)
+    except Exception as error:  # noqa: BLE001 - any capture failure means "time it the plain way"
+        torch.cuda.synchronize()
+        if where not in _UNCAPTURABLE:
+            _UNCAPTURABLE.add(where)
+            _LOGGER.warning("autotune: %s cannot be captured in a CUDA graph (%s); timed on a plain stream",
+                            where, type(error).__name__)
+        return None
+    start = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
+    stop = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
+    best: list[float] = []
+    with torch.cuda.stream(stream):
+        for graph in graphs:
+            graph.replay()
+            fastest = float("inf")
+            for _ in range(_GRAPH_REPLAYS):
+                start.record(stream)  # type: ignore[no-untyped-call]
+                graph.replay()
+                stop.record(stream)  # type: ignore[no-untyped-call]
+                stop.synchronize()  # type: ignore[no-untyped-call]
+                fastest = min(fastest, start.elapsed_time(stop))  # type: ignore[no-untyped-call]
+            best.append(fastest)
+    del graphs
+    torch.cuda.synchronize()
+    return max(best[0] - best[1], 1e-6) / _GRAPH_CALLS
+
+
+def _as_result(milliseconds: float, quantiles: tuple[float, ...] | list[float] | None) -> list[float] | float:
+    return [milliseconds] * len(quantiles) if quantiles is not None else milliseconds
+
+
+def graph_do_bench(
+    fn: Callable[[], object],
+    warmup: int = 25,
+    rep: int = 100,
+    grad_to_none: object = None,
+    quantiles: tuple[float, ...] | list[float] | None = None,
+    return_mode: str = "mean",
+) -> list[float] | float:
+    """`triton.testing.do_bench`'s measurement (L2 flushed before every call), timed inside CUDA graphs."""
+    cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
+    milliseconds = _graph_milliseconds(cache.zero_, fn, getattr(fn, "__qualname__", "kernel"))
+    if milliseconds is None:
+        return cast("list[float] | float", triton.testing.do_bench(
+            fn, warmup=warmup, rep=rep, grad_to_none=grad_to_none, quantiles=quantiles, return_mode=return_mode))
+    return _as_result(milliseconds, quantiles)
+
+
+def _install_graph_benchmarker() -> None:
+    """Make every autotuner that does not name its own benchmarker time through `graph_do_bench`.
+
+    Triton resolves an autotuner's default benchmarker lazily, at its first bench (`Autotuner.do_bench`, a cached
+    property over `driver.active.get_benchmarker()`), so replacing the NVIDIA driver's method here is enough for every
+    kernel module imported with this one.
+    """
+    from triton.backends.nvidia.driver import CudaDriver  # noqa: PLC0415
+
+    CudaDriver.get_benchmarker = lambda self: graph_do_bench  # type: ignore[method-assign]  # noqa: ARG005
+
+
+if _TIMING == "graph":
+    _install_graph_benchmarker()
+
+
 def cold_do_bench(
     fn: object,
     warmup: int = 5,
@@ -157,6 +259,16 @@ def cold_do_bench(
             entry = (weakref.ref(t), t.detach().cpu().pin_memory())
             _HOST_MIRROR_CACHE[key] = entry
         host_mirrors.append(entry[1])
+
+    if _TIMING == "graph":
+        def upload() -> None:
+            for t, h in zip(gpu_tensors, host_mirrors, strict=True):
+                t.copy_(h, non_blocking=True)
+
+        milliseconds = _graph_milliseconds(upload, cast("Callable[[], object]", fn),
+                                           getattr(fn, "__qualname__", "kernel"))
+        if milliseconds is not None:
+            return _as_result(milliseconds, quantiles)
 
     for _ in range(warmup):
         fn()
