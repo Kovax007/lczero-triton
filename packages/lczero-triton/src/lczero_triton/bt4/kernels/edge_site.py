@@ -127,6 +127,7 @@ def _edge_site_body(  # noqa: PLR0913
     pixels: tl.constexpr,
     tile_rows: tl.constexpr,
     dot_fp16: tl.constexpr = False,
+    heads_pad: tl.constexpr = 0,
 ) -> None:
     """Update the edge state of one run (or, with ``tile_rows``, one tile) of ``pixels`` cells of one sample.
 
@@ -156,13 +157,26 @@ def _edge_site_body(  # noqa: PLR0913
         mirrored = (cells % 64) * 64 + cells // 64
         mirrored_values = tl.load(state + (sample * states + channels[:, None]) * 4096 + mirrored[None, :])
     if stage != _STAGE_FFN:
-        head_index = tl.arange(0, heads)
-        logit_values = tl.load(logits + (sample * heads + head_index[:, None]) * 4096 + cells[None, :])
-        readback_values = tl.load(readback + channels[:, None] * heads + head_index[None, :])
+        if heads_pad == 0:
+            head_index = tl.arange(0, heads)
+            logit_values = tl.load(logits + (sample * heads + head_index[:, None]) * 4096 + cells[None, :])
+            readback_values = tl.load(readback + channels[:, None] * heads + head_index[None, :])
+        else:
+            # A head count that is not a power of two: the dot's K axis padded, the missing heads read as zero.
+            head_index = tl.arange(0, heads_pad)
+            live = head_index < heads
+            logit_values = tl.load(logits + (sample * heads + head_index[:, None]) * 4096 + cells[None, :],
+                                   mask=live[:, None], other=0.0)
+            readback_values = tl.load(readback + channels[:, None] * heads + head_index[None, :],
+                                      mask=live[None, :], other=0.0)
         values = tl.dot(readback_values, logit_values, values, input_precision="ieee")  # e_hat
         if reverse:
             # One-call site: `state` is still e, so the mirrored e_hat takes the mirrored readback too.
-            mirrored_logits = tl.load(logits + (sample * heads + head_index[:, None]) * 4096 + mirrored[None, :])
+            if heads_pad == 0:
+                mirrored_logits = tl.load(logits + (sample * heads + head_index[:, None]) * 4096 + mirrored[None, :])
+            else:
+                mirrored_logits = tl.load(logits + (sample * heads + head_index[:, None]) * 4096 + mirrored[None, :],
+                                          mask=live[:, None], other=0.0)
             mirrored_values = tl.dot(readback_values, mirrored_logits, mirrored_values, input_precision="ieee")
     if stage == _STAGE_READBACK:
         # K4 extension point: the triplet kernel adds its branch to this e_hat, then stage "ffn" runs.
@@ -227,7 +241,10 @@ class EdgeSiteSpecialization:
 
     def __post_init__(self) -> None:
         """Reject widths a ``tl.arange`` tile cannot take."""
-        for name in ("heads", "states", "hidden"):
+        if not 0 < self.heads <= 64:  # noqa: PLR2004
+            message = f"EdgeSiteSpecialization.heads={self.heads} must be in 1..64"
+            raise ValueError(message)
+        for name in ("states", "hidden"):
             width = getattr(self, name)
             if width <= 0 or width & (width - 1):
                 message = f"EdgeSiteSpecialization.{name}={width} must be a power of two"
@@ -259,6 +276,13 @@ def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
     return (cast("int", configuration["batch_count"]) * CELLS // cast("int", configuration["pixels"]),)
 
 
+def _heads_pad(heads: int) -> int:
+    """0 for a power-of-two head count (the unpadded kernel), else the next power of two (at least 16, tl.dot)."""
+    if heads & (heads - 1) == 0:
+        return 0
+    return max(16, 1 << heads.bit_length())
+
+
 def compile_edge_site(specialization: EdgeSiteSpecialization) -> KernelArtifact:
     """Autotune and compile one edge update site specialization."""
     batch, states, heads, hidden = (
@@ -275,7 +299,7 @@ def compile_edge_site(specialization: EdgeSiteSpecialization) -> KernelArtifact:
     compiled = _edge_site_kernel[_autotune_grid](
         output, state, logits, readback, dense1_weight, dense1_bias, dense2_weight, dense1_reverse,
         batch, heads, states, hidden, _STAGES[specialization.stage], EPSILON, specialization.reverse,
-        dot_fp16=specialization.dot == "fp16",
+        dot_fp16=specialization.dot == "fp16", heads_pad=_heads_pad(heads),
     )
     pixels = cast("int", _edge_site_kernel.best_config.kwargs["pixels"])
     parameters = tuple(

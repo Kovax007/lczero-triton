@@ -200,6 +200,7 @@ def _triplet_readback_prep_body(  # noqa: PLR0913
     states: tl.constexpr,
     epsilon: tl.constexpr,
     pixels: tl.constexpr,
+    site_heads_pad: tl.constexpr = 0,
 ) -> None:
     """K4b (a): ``e_hat = e + O_e H`` (K3's readback dot) into ``output``, then ``prep`` from the same registers.
 
@@ -214,9 +215,18 @@ def _triplet_readback_prep_body(  # noqa: PLR0913
     wide = tl.arange(0, 2 * states)
     planes = channels[:, None] * 4096 + cells[None, :]
     current = tl.load(state + sample * states * 4096 + planes)  # e, [states, pixels]
-    head_index = tl.arange(0, site_heads)
-    logit_values = tl.load(logits + (sample * site_heads + head_index[:, None]) * 4096 + cells[None, :])
-    readback_values = tl.load(readback_weight + channels[:, None] * site_heads + head_index[None, :])
+    if site_heads_pad == 0:
+        head_index = tl.arange(0, site_heads)
+        logit_values = tl.load(logits + (sample * site_heads + head_index[:, None]) * 4096 + cells[None, :])
+        readback_values = tl.load(readback_weight + channels[:, None] * site_heads + head_index[None, :])
+    else:
+        # A head count that is not a power of two: the dot's K axis padded, the missing heads read as zero.
+        head_index = tl.arange(0, site_heads_pad)
+        live = head_index < site_heads
+        logit_values = tl.load(logits + (sample * site_heads + head_index[:, None]) * 4096 + cells[None, :],
+                               mask=live[:, None], other=0.0)
+        readback_values = tl.load(readback_weight + channels[:, None] * site_heads + head_index[None, :],
+                                  mask=live[None, :], other=0.0)
     e_hat = tl.dot(readback_values, logit_values, current, input_precision="ieee")  # K3's expression, verbatim
     tl.store(output + sample * states * 4096 + planes, e_hat)
     normed = _rms_columns(e_hat, states, epsilon)
@@ -290,6 +300,7 @@ def _triplet_readback_body(  # noqa: PLR0913
     site_heads: tl.constexpr,
     states: tl.constexpr,
     pixels: tl.constexpr,
+    site_heads_pad: tl.constexpr = 0,
 ) -> None:
     """K3's readback (``e_hat = e + O_e H``, the same expression) into ``output``, plus an FP16 copy for `fused`."""
     program = tl.program_id(0)
@@ -299,9 +310,18 @@ def _triplet_readback_body(  # noqa: PLR0913
     channels = tl.arange(0, states)
     planes = channels[:, None] * 4096 + cells[None, :]
     current = tl.load(state + sample * states * 4096 + planes)
-    head_index = tl.arange(0, site_heads)
-    logit_values = tl.load(logits + (sample * site_heads + head_index[:, None]) * 4096 + cells[None, :])
-    readback_values = tl.load(readback_weight + channels[:, None] * site_heads + head_index[None, :])
+    if site_heads_pad == 0:
+        head_index = tl.arange(0, site_heads)
+        logit_values = tl.load(logits + (sample * site_heads + head_index[:, None]) * 4096 + cells[None, :])
+        readback_values = tl.load(readback_weight + channels[:, None] * site_heads + head_index[None, :])
+    else:
+        # A head count that is not a power of two: the dot's K axis padded, the missing heads read as zero.
+        head_index = tl.arange(0, site_heads_pad)
+        live = head_index < site_heads
+        logit_values = tl.load(logits + (sample * site_heads + head_index[:, None]) * 4096 + cells[None, :],
+                               mask=live[:, None], other=0.0)
+        readback_values = tl.load(readback_weight + channels[:, None] * site_heads + head_index[None, :],
+                                  mask=live[None, :], other=0.0)
     e_hat = tl.dot(readback_values, logit_values, current, input_precision="ieee")
     tl.store(output + sample * states * 4096 + planes, e_hat)
     tl.store(copy + sample * states * 4096 + planes, e_hat.to(tl.float16))
@@ -539,7 +559,10 @@ class TripletSiteSpecialization:
 
     def __post_init__(self) -> None:
         """Reject widths a ``tl.arange`` tile cannot take, and a value width the two directions cannot fill."""
-        for name in ("states", "heads", "dots", "site_heads", "site_hidden"):
+        if not 0 < self.site_heads <= 64:  # noqa: PLR2004
+            message = f"TripletSiteSpecialization.site_heads={self.site_heads} must be in 1..64"
+            raise ValueError(message)
+        for name in ("states", "heads", "dots", "site_hidden"):
             width = getattr(self, name)
             if width <= 0 or width & (width - 1):
                 message = f"TripletSiteSpecialization.{name}={width} must be a power of two"
@@ -605,6 +628,13 @@ def _fused_grid(configuration: Mapping[str, object]) -> tuple[int]:
                             cast("int", configuration["dots"]), cast("int", configuration["group"])),)
 
 
+def _site_heads_pad(site_heads: int) -> int:
+    """0 for a power-of-two head count (the unpadded kernel), else the next power of two (at least 16, tl.dot)."""
+    if site_heads & (site_heads - 1) == 0:
+        return 0
+    return max(16, 1 << site_heads.bit_length())
+
+
 def _inputs(specialization: TripletSiteSpecialization) -> dict[str, torch.Tensor]:
     """Return zeroed tensors of every buffer and table shape, for autotuning and compilation."""
     batch, states, site_heads = specialization.batch_count, specialization.states, specialization.site_heads
@@ -647,6 +677,7 @@ def compile_triplet_readback_prep(specialization: TripletSiteSpecialization) -> 
         tensors["values"], tensors["gates"], tensors["output"], tensors["state"], tensors["logits"],
         tensors["readback_weight"], tensors["value_weight"], tensors["gate_weight"], tensors["gate_bias"],
         specialization.batch_count, specialization.site_heads, specialization.states, EPSILON,
+        site_heads_pad=_site_heads_pad(specialization.site_heads),
     )
     pixels = cast("int", _triplet_readback_prep_kernel.best_config.kwargs["pixels"])
     return artifact_from_triton(
@@ -676,6 +707,7 @@ def compile_triplet_readback(specialization: TripletSiteSpecialization) -> Kerne
     compiled = _triplet_readback_kernel[_planar_grid](
         tensors["output"], tensors["copy"], tensors["state"], tensors["logits"], tensors["readback_weight"],
         specialization.batch_count, specialization.site_heads, specialization.states,
+        site_heads_pad=_site_heads_pad(specialization.site_heads),
     )
     pixels = cast("int", _triplet_readback_kernel.best_config.kwargs["pixels"])
     return artifact_from_triton(
