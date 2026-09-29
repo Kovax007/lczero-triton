@@ -49,6 +49,7 @@ from ``state``, writes e'). The triplet cannot live inside these programs: its s
 columns of the 64 x 64 grid, while a site program sees only its own cells.
 """
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -218,11 +219,40 @@ def _edge_site_body(  # noqa: PLR0913
             tl.store(copy_out + (sample * 4096 + cells[None, :]) * states + channels[:, None], e_new.to(tl.float16))
 
 
+def _pins(value: str) -> dict[int, tuple[int, int, int]]:
+    """``LC0EX_EDGE_SITE_PIN``: ``stage=PIXELSxTILE_ROWSwWARPS`` per stage, comma-separated (``ffn=64x8w2``)."""
+    pins = {}
+    for item in filter(None, (part.strip() for part in value.split(","))):
+        stage, _, config = item.partition("=")
+        pixels, _, rest = config.partition("x")
+        rows, _, warps = rest.partition("w")
+        if stage not in _STAGES or not (pixels.isdigit() and rows.isdigit() and warps.isdigit()):
+            message = f"LC0EX_EDGE_SITE_PIN item {item!r}: expected stage=PIXELSxTILE_ROWSwWARPS, stage one of {sorted(_STAGES)}"
+            raise ValueError(message)
+        pins[_STAGES[stage]] = (int(pixels), int(rows), int(warps))
+    return pins
+
+
+# LC0EX_EDGE_SITE_PIN (backend 09-29): one configuration per stage, chosen by in-net measurement. The isolated autotune ranks
+# near-equal configurations by noise and can rank them the wrong way round in the whole net (H3b's site FFN: 4 warps wins by 0.5 us
+# alone, 2 warps is 3.4 us faster in-net), so builds of the same switches differed by 0.5 % at b64.
+_PINS = _pins(os.environ.get("LC0EX_EDGE_SITE_PIN", ""))
+
+
 def _prune_site_configs(configs: list[triton.Config], named_args: dict[str, object], **kwargs: object) -> list[triton.Config]:
-    """The tile form competes only where it can win: on a site that reads the reverse edge."""
-    if named_args.get("reverse", kwargs.get("reverse")):
+    """The tile form competes only where it can win: on a site that reads the reverse edge. A pinned stage keeps its one config."""
+    if not named_args.get("reverse", kwargs.get("reverse")):
+        configs = [config for config in configs if config.kwargs["tile_rows"] == 0]
+    stage = named_args.get("stage", kwargs.get("stage"))
+    pin = _PINS.get(int(stage)) if stage is not None else None
+    if pin is None:
         return configs
-    return [config for config in configs if config.kwargs["tile_rows"] == 0]
+    pinned = [config for config in configs
+              if (config.kwargs["pixels"], config.kwargs["tile_rows"], config.num_warps) == pin]
+    if not pinned:
+        message = f"LC0EX_EDGE_SITE_PIN {pin} is not among this specialization's configurations"
+        raise ValueError(message)
+    return pinned
 
 
 _edge_site_kernel = triton.autotune(
