@@ -71,14 +71,25 @@ from lczero_triton.bt4.kernels.triplet_site import (
 )
 from lczero_triton.bt4.kernels.triplet_site import buffer_bytes as triplet_buffer_bytes
 from lczero_triton.bt4.kernels.triplet_site import triplet_table_names
+from lczero_triton.bt4.kernels.attention_egt_v9 import (
+    AttentionEgtV9Specialization,
+    PackEgtV9Specialization,
+    attention_egt_v9,
+    pack_egt_v9_tables,
+    packed_bytes,
+    served_tables,
+)
+from lczero_triton.bt4.kernels.attention_egt_v9 import supports as egt_v9_supports
 from lczero_triton.bt4.kernels.egt_state_tiles import (
     EGT_STATE_AMAX,
     TILE_TABLES,
+    CastStateCellMajorSpecialization,
     CastStateF8Specialization,
     CastStateI8Specialization,
     CastStateSpecialization,
     StateTilesSpecialization,
     cast_state,
+    cast_state_cell_major,
     cast_state_f8,
     cast_state_i8,
     egt_state_tiles,
@@ -221,6 +232,14 @@ _EGT_LIST_F16 = os.environ.get("LC0EX_EGT_LIST_F16") == "1"
 # LC0EX_EGT_ARITH=auto (B9's shipping form): autotune picks, per rung and card, the served arithmetic or
 # LC0EX_EGT_ACC=f16 + LC0EX_EGT_STATE_MATH=f16 (gated equivalent); exclusive with setting either of those two.
 _EGT_ARITH_AUTO = os.environ.get("LC0EX_EGT_ARITH", "fixed") == "auto"
+# v9 (backend 09-29, `attention_egt_v9`): LC0EX_EGT_V9=1 serves the EGT2 attention of the H3 shape (heads % 4, head_dim 16 / 32,
+# output gate) with the v9 CUBIN at every rung >= LC0EX_EGT_V9_MIN_BATCH that reads the FP16 copy; that rung's copy is then written
+# cell-major. Other rungs, other shapes and the blocks that do not read the edge stream keep the Triton kernel.
+# LC0EX_EGT_V9_CONTROL=no_sigma builds the fidelity gate's CONTROL (must fail); LC0EX_EGT_V9_SKEW overrides the head-slot skew.
+_EGT_V9 = os.environ.get("LC0EX_EGT_V9", "0") == "1"
+_EGT_V9_MIN_BATCH = int(os.environ.get("LC0EX_EGT_V9_MIN_BATCH", "32"))
+_EGT_V9_CONTROL = os.environ.get("LC0EX_EGT_V9_CONTROL", "")
+_EGT_V9_SKEW = int(os.environ.get("LC0EX_EGT_V9_SKEW", "6000"))
 if _EGT_ARITH_AUTO and (_EGT_ACC == "f16" or _EGT_STATE_MATH == "f16"):
     message = "LC0EX_EGT_ARITH=auto chooses the arithmetic itself; unset LC0EX_EGT_ACC / LC0EX_EGT_STATE_MATH"
     raise ValueError(message)
@@ -249,6 +268,19 @@ _TRIPLET_OUT_FFN = os.environ.get("LC0EX_TRIPLET_OUT_FFN") == "1"
 # "3,4,9".
 _EGT_READ_BLOCKS = os.environ.get("LC0EX_EGT_READ_BLOCKS", "all")
 _EGT_NO_READ_TERMS = EGT_FULL & ~EGT_STATE_TERMS
+
+
+def _egt_v9_active(batch: int, shape: object) -> bool:
+    """Whether this rung serves the EGT2 attention with v9 (`LC0EX_EGT_V9`)."""
+    return (_EGT_V9 and batch >= _EGT_V9_MIN_BATCH and _egt_state_mode(batch) == "f16" and _EGT_ROUNDS == 1
+            and egt_v9_supports(shape.heads, shape.head_dim, output_gate=shape.output_gate))
+
+
+def _device_sms() -> int:
+    """The build device's SM count: v9's persistent grid (the build runs on a card of the target class)."""
+    import torch  # noqa: PLC0415  # the builder imports torch through the kernels already
+
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
 
 def _egt_state_mode(batch: int) -> str:
@@ -942,6 +974,10 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
     copy_bytes = {"f16": _F16_BYTES, "f8": 1, "i8": 1}.get(mode, 0)  # r23b I8: one byte, like e4m3
     copy = context.raw(copy_bytes * egt.state_channels * cells) if copy_bytes and read_blocks else None  # r23b §7
     writes = 1 + len(sites)
+    v9 = _egt_v9_active(batch, shape)
+    if v9:
+        _LOGGER.info("batch size %d: EGT2 attention v9 (CUBIN, cell-major FP16 state copy, %d SMs, control %r)", batch,
+                     _device_sms(), _EGT_V9_CONTROL)
 
     def copy_specialization(write: int) -> object:
         # Round 26 C3: the scale of THIS write (the seed is write 0, the k-th site write k + 1).
@@ -950,9 +986,11 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
             return CastStateF8Specialization(batch, context.architecture, scales, states=egt.state_channels)
         if mode == "i8":  # r23b I8
             return CastStateI8Specialization(batch, context.architecture, scales, states=egt.state_channels)
+        if v9:  # v9 reads a cell's 16 channels in one 32-byte load
+            return CastStateCellMajorSpecialization(batch, context.architecture, states=egt.state_channels)
         return CastStateSpecialization(batch, context.architecture, states=egt.state_channels)
 
-    write_copy = {"f8": cast_state_f8, "i8": cast_state_i8}.get(mode, cast_state)
+    write_copy = {"f8": cast_state_f8, "i8": cast_state_i8}.get(mode, cast_state_cell_major if v9 else cast_state)
     written = 0  # the write the copy currently holds
     if copy is not None:
         write_copy(context.builder, context.kernels, copy, state[0], copy_specialization(written))
@@ -963,7 +1001,7 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
         body, codes = _encoder_egt(context, lab, body, edges, edge_norm, copy if copy is not None else state[current],
                                    edge_list, logits, index, export_h=index in sites, state=state[current],
                                    reads=index in read_blocks, body_codes=codes,  # r23b §7; Q1
-                                   copy_scales=_egt_copy_scales(mode, egt.state_channels, written, writes))
+                                   copy_scales=_egt_copy_scales(mode, egt.state_channels, written, writes), v9=v9)
         if index in sites:
             # `rev_edge` (BT6-test): the site's FFN also reads the reverse edge through `ffn/dense1_rev/w`.
             reverse = sites[index].ffn_rev_weight is not None
@@ -1050,7 +1088,7 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
 def _encoder_egt(  # noqa: PLR0913
     context: _Context, lab: LabNetwork, body: Buffer, edges: Buffer, edge_norm: Buffer, edge_state: Buffer,
     edge_list: EgtEdgeList, logits: Buffer, index: int, *, export_h: bool, state: Buffer, reads: bool = True,
-    body_codes: Buffer | None = None, copy_scales: tuple[float, ...] | None = None,
+    body_codes: Buffer | None = None, copy_scales: tuple[float, ...] | None = None, v9: bool = False,
 ) -> tuple[Buffer, Buffer | None]:
     """One EGT2 encoder block: packed QKV, `attention_egt`, then the static residual branch, LN1, GLU FFN, LN2.
 
@@ -1133,6 +1171,23 @@ def _encoder_egt(  # noqa: PLR0913
                                            head_base=head_base),
                 logits=logits if export_h else None, quant_prescale=attn_prescale,
             )
+    elif v9:
+        # v9 (`attention_egt_v9`): `edge_state` is the cell-major FP16 copy; the edge list is not read. The block's FP16 packs
+        # (query / key tables, weights, constant bias) are its own persistent buffers, written from the plans every batch.
+        packs = {name: context.builder.persistent_tensor(shape=(size // _F16_BYTES,), dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+                                                         writable=True, alignment_bytes=256)
+                 for name, size in packed_bytes(shape.heads, shape.head_dim).items()}
+        pack_egt_v9_tables(context.builder, context.kernels, packs, tables,
+                           PackEgtV9Specialization(shape.heads, shape.head_dim, context.architecture))
+        attention_egt_v9(
+            context.builder, context.kernels, merged, qkv, edges, edge_norm, edge_state, served_tables(tables, packs),
+            AttentionEgtV9Specialization(
+                batch_size=context.batch_size, heads=shape.heads, head_dim=shape.head_dim,
+                architecture=context.architecture, sms=_device_sms(), cap=edge.cap, output_gate=gated,
+                gate_scale=common["gate_scale"], export_h=export_h, quant_output=fused_codes, skew=_EGT_V9_SKEW,
+                control=_EGT_V9_CONTROL),
+            logits=logits if export_h else None, quant_prescale=attn_prescale,
+        )
     else:
         mode = _egt_state_mode(context.batch_size)
         f8 = mode == "f8"  # r23 F8: the e4m3 copy, read back through its per-channel scale

@@ -157,6 +157,25 @@ def _cast_state_body(
 
 
 @triton.jit
+def _cast_state_cell_major_body(
+    output,
+    state,
+    batch_count: tl.constexpr,  # noqa: ARG001  # Autotune key and launch grid.
+    states: tl.constexpr,
+    pixels: tl.constexpr,
+) -> None:
+    """v9: FP32 planar state -> FP16 CELL-MAJOR copy ``[batch, 64, 64, states]`` (a cell's channels contiguous: one 32-byte read
+    per cell in `egt_v9.cu`), one run of ``pixels`` cells of one sample."""
+    program = tl.program_id(0)
+    runs: tl.constexpr = 4096 // pixels
+    sample = program // runs
+    cells = (program % runs) * pixels + tl.arange(0, pixels)
+    channels = tl.arange(0, states)
+    values = tl.load(state + (sample * states + channels[:, None]) * 4096 + cells[None, :]).to(tl.float16)
+    tl.store(output + (sample * 4096 + cells[None, :]) * states + channels[:, None], values)
+
+
+@triton.jit
 def _cast_state_f8_body(
     output,
     state,
@@ -215,6 +234,11 @@ _cast_state_kernel = triton.autotune(
     key=["batch_count", "states"],
     cache_results=True,
 )(_cast_state_body)
+_cast_state_cell_major_kernel = triton.autotune(
+    configs=[triton.Config({"pixels": pixels}, num_warps=warps) for pixels, warps in _CONFIGURATIONS],
+    key=["batch_count", "states"],
+    cache_results=True,
+)(_cast_state_cell_major_body)
 
 
 _cast_state_f8_kernel = triton.autotune(
@@ -254,6 +278,15 @@ class StateTilesSpecialization:
         if self.head_base < 0 or self.head_base % self.round_heads:
             message = f"head_base={self.head_base} must be a multiple of round_heads={self.round_heads}"
             raise ValueError(message)
+
+
+@dataclass(frozen=True, slots=True)
+class CastStateCellMajorSpecialization:
+    """v9: the FP32 -> FP16 cell-major state copy (`egt_v9.cu` reads it)."""
+
+    batch_count: int
+    architecture: int
+    states: int = STATES
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +361,12 @@ def launch_cast_state(output: torch.Tensor, state: torch.Tensor, specialization:
     return _cast_state_kernel[_planar_grid](output, state, specialization.batch_count, specialization.states)
 
 
+def launch_cast_state_cell_major(output: torch.Tensor, state: torch.Tensor,
+                                 specialization: CastStateCellMajorSpecialization) -> object:
+    """Launch on torch tensors: `output` is ``[batch, 64, 64, states]`` FP16."""
+    return _cast_state_cell_major_kernel[_planar_grid](output, state, specialization.batch_count, specialization.states)
+
+
 def launch_cast_state_f8(output: torch.Tensor, state: torch.Tensor,
                          specialization: CastStateF8Specialization) -> object:
     """Launch the e4m3 copy on torch tensors."""
@@ -365,6 +404,17 @@ def compile_cast_state(specialization: CastStateSpecialization) -> KernelArtifac
     pixels = cast("int", _cast_state_kernel.best_config.kwargs["pixels"])
     return artifact_from_triton(compiled, grid=(batch * CELLS // pixels, 1, 1), parameters=(_POINTER,) * 2,
                                 autotuner=_cast_state_kernel)
+
+
+def compile_cast_state_cell_major(specialization: CastStateCellMajorSpecialization) -> KernelArtifact:
+    """Autotune and compile one cell-major state-copy specialization."""
+    batch, states = specialization.batch_count, specialization.states
+    output = torch.empty((batch, 64, 64, states), dtype=torch.float16, device="cuda")
+    state = torch.zeros((batch, states, 64, 64), dtype=torch.float32, device="cuda")
+    compiled = launch_cast_state_cell_major(output, state, specialization)
+    pixels = cast("int", _cast_state_cell_major_kernel.best_config.kwargs["pixels"])
+    return artifact_from_triton(compiled, grid=(batch * CELLS // pixels, 1, 1), parameters=(_POINTER,) * 2,
+                                autotuner=_cast_state_cell_major_kernel)
 
 
 def compile_cast_state_f8(specialization: CastStateF8Specialization) -> KernelArtifact:
@@ -427,6 +477,19 @@ def cast_state_f8(
     """Append one FP32 -> e4m3 copy of the state (r23 F8: e4m3 read mode)."""
     builder.set_target(lc0ex_pb2.Target.VENDOR_NVIDIA, f"sm_{specialization.architecture}")
     kernel = kernels.get(compile_cast_state_f8, specialization)
+    builder.call(kernel, output, state, readonly=(state,))
+
+
+def cast_state_cell_major(
+    builder: ProgramBuilder,
+    kernels: KernelCache,
+    output: Buffer,
+    state: Buffer,
+    specialization: CastStateCellMajorSpecialization,
+) -> None:
+    """Append one FP32 -> FP16 cell-major copy of the state (v9's read)."""
+    builder.set_target(lc0ex_pb2.Target.VENDOR_NVIDIA, f"sm_{specialization.architecture}")
+    kernel = kernels.get(compile_cast_state_cell_major, specialization)
     builder.call(kernel, output, state, readonly=(state,))
 
 
