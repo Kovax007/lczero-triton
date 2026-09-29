@@ -25,7 +25,8 @@ The tables are R0's plans, FP32 and already ``[out, in]``. Every step is FP32 (t
 Layouts (fixed interfaces)
 --------------------------
 * ``logits`` (K2's H): FP32 ``[B * heads, 64, 64]``, index ``(sample * heads + head) * 4096 + 64 * i + j``, the
-  post-door, pre-softmax logits of the block the site follows.
+  post-door, pre-softmax logits of the block the site follows. FP16 with ``logits_f16`` (attention v9's FP16 export); the
+  readback dot still runs in FP32 on the widened values.
 * ``state`` (e) and ``output`` (e'): FP32 ``[B, 16, 64, 64]``, index ``sample * 16 * 4096 + c * 4096 + 64 * i + j``
   (K1's e0 layout). ``output`` is a separate buffer.
 
@@ -159,24 +160,25 @@ def _edge_site_body(  # noqa: PLR0913
     if stage != _STAGE_FFN:
         if heads_pad == 0:
             head_index = tl.arange(0, heads)
-            logit_values = tl.load(logits + (sample * heads + head_index[:, None]) * 4096 + cells[None, :])
+            logit_values = tl.load(logits + (sample * heads + head_index[:, None]) * 4096 + cells[None, :]).to(tl.float32)
             readback_values = tl.load(readback + channels[:, None] * heads + head_index[None, :])
         else:
             # A head count that is not a power of two: the dot's K axis padded, the missing heads read as zero.
             head_index = tl.arange(0, heads_pad)
             live = head_index < heads
             logit_values = tl.load(logits + (sample * heads + head_index[:, None]) * 4096 + cells[None, :],
-                                   mask=live[:, None], other=0.0)
+                                   mask=live[:, None], other=0.0).to(tl.float32)
             readback_values = tl.load(readback + channels[:, None] * heads + head_index[None, :],
                                       mask=live[None, :], other=0.0)
         values = tl.dot(readback_values, logit_values, values, input_precision="ieee")  # e_hat
         if reverse:
             # One-call site: `state` is still e, so the mirrored e_hat takes the mirrored readback too.
             if heads_pad == 0:
-                mirrored_logits = tl.load(logits + (sample * heads + head_index[:, None]) * 4096 + mirrored[None, :])
+                mirrored_logits = tl.load(
+                    logits + (sample * heads + head_index[:, None]) * 4096 + mirrored[None, :]).to(tl.float32)
             else:
                 mirrored_logits = tl.load(logits + (sample * heads + head_index[:, None]) * 4096 + mirrored[None, :],
-                                          mask=live[:, None], other=0.0)
+                                          mask=live[:, None], other=0.0).to(tl.float32)
             mirrored_values = tl.dot(readback_values, mirrored_logits, mirrored_values, input_precision="ieee")
     if stage == _STAGE_READBACK:
         # K4 extension point: the triplet kernel adds its branch to this e_hat, then stage "ffn" runs.
@@ -238,6 +240,8 @@ class EdgeSiteSpecialization:
     reverse: bool = False
     # Round 26 C2: "ieee" (K3's FP32 class, the default) or "fp16" (the FFN's maps on the tensor cores).
     dot: str = "ieee"
+    # H read as FP16 (attention v9's `h_f16` export); stages "site" and "readback" only.
+    logits_f16: bool = False
 
     def __post_init__(self) -> None:
         """Reject widths a ``tl.arange`` tile cannot take."""
@@ -258,6 +262,9 @@ class EdgeSiteSpecialization:
         if self.dot not in ("ieee", "fp16"):
             message = f"EdgeSiteSpecialization.dot={self.dot!r}; expected ieee or fp16"
             raise ValueError(message)
+        if self.logits_f16 and self.stage == "ffn":
+            message = "stage 'ffn' reads no logits; logits_f16 belongs to stages 'site' and 'readback'"
+            raise ValueError(message)
 
 
 def buffer_bytes(specialization: EdgeSiteSpecialization) -> dict[str, int]:
@@ -266,7 +273,7 @@ def buffer_bytes(specialization: EdgeSiteSpecialization) -> dict[str, int]:
     return {
         "output": 4 * specialization.states * cells,
         "state": 4 * specialization.states * cells,
-        "logits": 4 * specialization.heads * cells,
+        "logits": (2 if specialization.logits_f16 else 4) * specialization.heads * cells,
         "hidden": 0,
     }
 
@@ -290,7 +297,8 @@ def compile_edge_site(specialization: EdgeSiteSpecialization) -> KernelArtifact:
     )
     output = torch.empty((batch, states, 64, 64), dtype=torch.float32, device="cuda")
     state = torch.zeros((batch, states, 64, 64), dtype=torch.float32, device="cuda")
-    logits = torch.zeros((batch * heads, 64, 64), dtype=torch.float32, device="cuda")
+    logits_dtype = torch.float16 if specialization.logits_f16 else torch.float32
+    logits = torch.zeros((batch * heads, 64, 64), dtype=logits_dtype, device="cuda")
     readback = torch.zeros((states, heads), dtype=torch.float32, device="cuda")
     dense1_weight = torch.zeros((hidden, states), dtype=torch.float32, device="cuda")
     dense1_bias = torch.zeros(hidden, dtype=torch.float32, device="cuda")

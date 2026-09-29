@@ -7,7 +7,8 @@ Checks per (shape, batch): int8 codes (or FP16 output) against float64 -- mismat
 H (export) against float64, determinism (two runs byte-identical); then, unless --check-only, graph-timed microseconds per call for v9
 and the served kernel (served FP32 and B9 FP16 arithmetic), interleaved rounds.
 
-usage: test_egt_v9_standalone.py [--real-e E_bits.bin] [--shapes 32x32] [--batches 16,64,84] [--export] [--f16-out] [--check-only]
+usage: test_egt_v9_standalone.py [--real-e E_bits.bin] [--shapes 32x32] [--batches 16,64,84] [--export [--h16]] [--f16-out]
+                                 [--check-only]
        E_bits.bin = K1's 1,024 real positions (Kovax/briefs_2026-09-11/r20c_itemE/K1/ref_egt/E_bits.bin, sha256 82bb95b2...).
 """
 
@@ -43,7 +44,7 @@ extern "C" int egt_v9_host_launch(void* out, void* hexp, const void* qkv, const 
     configured = true;
   }}
   egt_v9_attention<<<grid, kThreads, kSmem, static_cast<cudaStream_t>(stream)>>>(
-      out, static_cast<float*>(hexp), static_cast<const __half*>(qkv), static_cast<const unsigned long long*>(edges),
+      out, hexp, static_cast<const __half*>(qkv), static_cast<const unsigned long long*>(edges),
       static_cast<const __half*>(norm), static_cast<const __half*>(state), static_cast<const float*>(t0),
       static_cast<const float*>(t1), static_cast<const float*>(t2), static_cast<const float*>(t3), static_cast<const float*>(t4),
       static_cast<const float*>(t5), static_cast<const float*>(t6), static_cast<const float*>(t7), static_cast<const float*>(t8),
@@ -62,7 +63,7 @@ def build(spec: AttentionEgtV9Specialization, directory: Path) -> ctypes.CDLL:
     source = directory / "host.cu"
     source.write_text(_HOST.format(source=os.environ.get("EGT_V9_SOURCE", SOURCE)), encoding="utf-8")
     library = directory / (f"egt_v9_{spec.heads}x{spec.head_dim}_b{spec.batch_size}_h{int(spec.export_h)}_f{int(not spec.quant_output)}"
-                           f"{'_packed' if spec.packed else ''}.so")
+                           f"{'_packed' if spec.packed else ''}{'_h16' if spec.h_f16 else ''}.so")
     command = [NVCC, "-O3", f"-arch=sm_{spec.architecture}", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", "-Xptxas", "-v", "-w",
                *compile_arguments(spec), *os.environ.get("EGT_V9_NVCC_EXTRA", "").split(), str(source), "-o", str(library)]
     done = subprocess.run(command, capture_output=True, text=True, check=False)  # noqa: S603
@@ -204,6 +205,7 @@ def main() -> int:  # noqa: C901, PLR0915
     parser.add_argument("--shapes", default="32x32")
     parser.add_argument("--batches", default="16,64,84")
     parser.add_argument("--export", action="store_true")
+    parser.add_argument("--h16", action="store_true", help="H exported in FP16 (step 3's form; needs --export)")
     parser.add_argument("--f16-out", action="store_true", help="FP16 output (the FP16 twin's form) instead of int8 codes")
     parser.add_argument("--control", default="")
     parser.add_argument("--check-only", action="store_true")
@@ -211,14 +213,14 @@ def main() -> int:  # noqa: C901, PLR0915
     args = parser.parse_args()
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     print(f"# {torch.cuda.get_device_name()} sm_{_arch()} ({sms} SMs); E {'real: ' + str(args.real_e) if args.real_e else 'random'}; "
-          f"export_h={args.export} f16_out={args.f16_out} control={args.control!r}")
+          f"export_h={args.export} h16={args.h16} f16_out={args.f16_out} control={args.control!r}")
     failed = False
     with tempfile.TemporaryDirectory(prefix="egt_v9_") as tmp:
         for shape in args.shapes.split(","):
             heads, depth = (int(v) for v in shape.split("x"))
             for batch in (int(b) for b in args.batches.split(",")):
                 spec = AttentionEgtV9Specialization(batch_size=batch, heads=heads, head_dim=depth, architecture=_arch(), sms=sms,
-                                                    cap=False, gate_scale=1.5, export_h=args.export,
+                                                    cap=False, gate_scale=1.5, export_h=args.export, h_f16=args.h16,
                                                     quant_output=not args.f16_out, control=args.control,
                                                     packed=not args.fp32_tables)
                 lib = build(spec, Path(tmp))
@@ -228,7 +230,9 @@ def main() -> int:  # noqa: C901, PLR0915
                 ref_out, ref_h = reference(x)
                 out_dtype = torch.float16 if args.f16_out else torch.int8
                 out = torch.zeros((batch, 64, width), dtype=out_dtype, device="cuda")
-                hexp = torch.full((batch * heads, 64, 64), float("nan"), device="cuda") if args.export else None
+                h_dtype = torch.float16 if args.h16 else torch.float32
+                hexp = (torch.full((batch * heads, 64, 64), float("nan"), dtype=h_dtype, device="cuda") if args.export
+                        else None)
                 v9_launch(lib, spec, x, out, hexp)()
                 again = torch.zeros_like(out)
                 v9_launch(lib, spec, x, again, hexp)()
@@ -246,8 +250,16 @@ def main() -> int:  # noqa: C901, PLR0915
                     line += f" codes: mismatches {100 * rate:.4f} % max |d| {diff.max().item()}"
                     ok = rate < 0.004 and diff.max().item() <= 1
                 if hexp is not None:
-                    herr = (hexp.double() - ref_h).abs().max().item()
-                    line += f"; H max |err| {herr:.2e}"
+                    dh = hexp.double() - ref_h
+                    herr = dh.abs().max().item()
+                    big = ref_h.abs() > 1.0
+                    rel = (dh.abs()[big] / ref_h.abs()[big]).max().item() if big.any() else 0.0
+                    # the readback's view of the error: e_hat = e + O H with a unit-scale O [16, heads] / sqrt(heads)
+                    readback = torch.randn(16, heads, dtype=torch.float64, device="cuda", generator=torch.Generator(
+                        device="cuda").manual_seed(5)) / heads ** 0.5
+                    e_err = torch.einsum("ch,bhij->bcij", readback, dh.view(batch, heads, 64, 64)).abs().max().item()
+                    line += (f"; H max |err| {herr:.2e} (|H| max {ref_h.abs().max().item():.1f}, rel {rel:.1e} above 1), "
+                             f"O.dH max {e_err:.2e}")
                     ok = ok and herr < 2e-2
                 if os.environ.get("EGT_V9_DUMP"):  # A/B of two kernel sources on identical inputs
                     torch.save({"out": out.cpu(), "h": hexp.cpu() if hexp is not None else None},

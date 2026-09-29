@@ -67,6 +67,8 @@ class AttentionEgtV9Specialization:
     output_gate: bool = True
     gate_scale: float = 2.0
     export_h: bool = False
+    # The H export in FP16 (read by `edge_site` with `logits_f16`): half the export's and the readback's H bytes.
+    h_f16: bool = False
     # True: the out-projection's int8 codes through `quant_prescale` (Q1); False: FP16 output (the FP16 twin, or a conversion pass).
     quant_output: bool = True
     # B9's gated arithmetic class: FP16 accumulate in the MMAs; 2 sigmoid(x) = 1 + tanh.approx(x / 2).
@@ -90,6 +92,9 @@ class AttentionEgtV9Specialization:
         if self.control not in CONTROLS:
             message = f"attention v9 control={self.control!r}; expected one of {CONTROLS}"
             raise ValueError(message)
+        if self.h_f16 and not self.export_h:
+            message = "attention v9 h_f16 is the H export's precision; it needs export_h"
+            raise ValueError(message)
         if shared_memory_bytes(self.head_dim) > 101376:
             message = "attention v9's shared memory is over the sm_89 / sm_120 opt-in ceiling"
             raise ValueError(message)
@@ -110,6 +115,7 @@ def compile_arguments(specialization: AttentionEgtV9Specialization) -> tuple[str
         f"-DOGATE={int(specialization.output_gate)}",
         f"-DCAP={int(specialization.cap)}",
         f"-DEXPORT_H={int(specialization.export_h)}",
+        f"-DH_F16={int(specialization.h_f16)}",
         f"-DOUT_F16={int(not specialization.quant_output)}",
         f"-DSKEW={specialization.skew}",
         f"-DSMEM_BYTES={shared_memory_bytes(specialization.head_dim)}",

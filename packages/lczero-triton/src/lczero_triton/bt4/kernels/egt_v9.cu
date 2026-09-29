@@ -10,7 +10,8 @@
 // Arithmetic class = B9 (FP16 E tables, HFMA2 state math, FP16 or FP32 MMA accumulate, FP32 softmax / prefix sums).
 // Inputs are the builder's own plan tables (FP32, `BLOCK_TABLES` order) and the cell-major FP16 state copy
 // (`egt_state_tiles.cast_state_cell_major`). Compile-time: HEADS, HD, HALVES (2 x batch), GATE_SCALE, OGATE, CAP, EXPORT_H,
-// OUT_F16 (FP16 output instead of int8 codes), ACC16, GATE_TANH, SKEW, SMEM_BYTES (checked against the layout).
+// OUT_F16 (FP16 output instead of int8 codes), ACC16, GATE_TANH, SKEW, SMEM_BYTES (checked against the layout), H_F16 (the H export
+// in FP16, each lane storing 8 consecutive keys: the edge site reads it with `logits_f16`).
 #include <cuda_fp16.h>
 #include <cstdint>
 
@@ -28,6 +29,9 @@
 #endif
 #ifndef EXPORT_H
 #define EXPORT_H 0
+#endif
+#ifndef H_F16
+#define H_F16 0
 #endif
 #ifndef OUT_F16
 #define OUT_F16 0
@@ -147,7 +151,7 @@ __device__ __forceinline__ uint32_t table_pair(const float* __restrict__ table, 
 }  // namespace
 
 extern "C" __global__ void __launch_bounds__(kThreads, 1) egt_v9_attention(
-    void* __restrict__ out_ptr, float* __restrict__ hexp, const __half* __restrict__ qkv,
+    void* __restrict__ out_ptr, void* __restrict__ hexp_ptr, const __half* __restrict__ qkv,
     const unsigned long long* __restrict__ edges, const __half* __restrict__ norm, const __half* __restrict__ state,
     const float* __restrict__ qk_scale_t, const float* __restrict__ attack_t, const float* __restrict__ key_t,
     const float* __restrict__ query_t, const float* __restrict__ scaled_t, const float* __restrict__ cbias,
@@ -159,6 +163,11 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) egt_v9_attention(
   (void)prescale;
 #else
   int8_t* out = static_cast<int8_t*>(out_ptr);
+#endif
+#if H_F16
+  __half* hexp = static_cast<__half*>(hexp_ptr);
+#else
+  float* hexp = static_cast<float*>(hexp_ptr);
 #endif
   extern __shared__ __align__(16) unsigned char smem[];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
@@ -552,11 +561,28 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) egt_v9_attention(
       for (int n = 0; n < 4; ++n) {
 #pragma unroll
         for (int b = 0; b < 2; ++b) hv[n][2 * a + b] *= 1.f + __low2float(dg[n][2 * a + b]);
-#if EXPORT_H
+#if EXPORT_H && !H_F16
         *reinterpret_cast<float2*>(hexp + (((size_t)sample * kHeads + h) * 64 + row0 + rl) * 64 + kh * 32 + 8 * n + 2 * t) =
             make_float2(hv[n][2 * a], hv[n][2 * a + 1]);
 #endif
       }
+#if EXPORT_H && H_F16
+      {  // FP16 H: a 4 x 4 transpose across the quad (lane t, register n) -> (lane n, register t) gives lane t the key half's
+         // n-tile t, 8 consecutive keys stored as one 16-byte write (a row's 32 keys = 64 contiguous bytes per instruction)
+        uint32_t p[4];
+#pragma unroll
+        for (int n = 0; n < 4; ++n) p[n] = pack(hv[n][2 * a], hv[n][2 * a + 1]);
+        const bool b1 = t & 2, b0 = t & 1;
+        uint32_t x0 = __shfl_xor_sync(0xffffffffu, b1 ? p[0] : p[2], 2);  // registers whose bit 1 differs from the lane's
+        uint32_t x1 = __shfl_xor_sync(0xffffffffu, b1 ? p[1] : p[3], 2);
+        if (b1) { p[0] = x0; p[1] = x1; } else { p[2] = x0; p[3] = x1; }
+        x0 = __shfl_xor_sync(0xffffffffu, b0 ? p[0] : p[1], 1);  // then bit 0
+        x1 = __shfl_xor_sync(0xffffffffu, b0 ? p[2] : p[3], 1);
+        if (b0) { p[0] = x0; p[2] = x1; } else { p[1] = x0; p[3] = x1; }
+        *reinterpret_cast<uint4*>(hexp + (((size_t)sample * kHeads + h) * 64 + row0 + rl) * 64 + kh * 32 + 8 * t) =
+            make_uint4(p[0], p[1], p[2], p[3]);
+      }
+#endif
     }
     TICK(3);
 

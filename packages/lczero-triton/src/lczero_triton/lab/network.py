@@ -240,6 +240,9 @@ _EGT_V9 = os.environ.get("LC0EX_EGT_V9", "0") == "1"
 _EGT_V9_MIN_BATCH = int(os.environ.get("LC0EX_EGT_V9_MIN_BATCH", "32"))
 _EGT_V9_CONTROL = os.environ.get("LC0EX_EGT_V9_CONTROL", "")
 _EGT_V9_SKEW = int(os.environ.get("LC0EX_EGT_V9_SKEW", "6000"))
+# LC0EX_EGT_V9_H16=1 (step 3): v9 exports H in FP16 and the edge sites read it so (half the H bytes of the export and the
+# readback). The site readback must be `edge_site`'s: triplet forms "readback_prep" and "fused" + state16 read FP32 H.
+_EGT_V9_H16 = os.environ.get("LC0EX_EGT_V9_H16", "0") == "1"
 if _EGT_ARITH_AUTO and (_EGT_ACC == "f16" or _EGT_STATE_MATH == "f16"):
     message = "LC0EX_EGT_ARITH=auto chooses the arithmetic itself; unset LC0EX_EGT_ACC / LC0EX_EGT_STATE_MATH"
     raise ValueError(message)
@@ -966,18 +969,24 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
         context.raw(_F32_BYTES * batch * _SQUARES), context.raw(_F32_BYTES * batch * _SQUARES),
     )
     egt_edge_list(context.builder, context.kernels, edge_list, edges, list_specialization)
+    v9 = _egt_v9_active(batch, shape)
+    h16 = v9 and _EGT_V9_H16
+    if h16 and any(site.triplet is not None for site in egt.sites) and (
+            _TRIPLET_FORM == "readback_prep" or (_TRIPLET_FORM == "fused" and _TRIPLET_STATE16)):
+        message = (f"LC0EX_EGT_V9_H16=1 needs the edge site's readback; LC0EX_TRIPLET_FORM={_TRIPLET_FORM!r} "
+                   f"(state16 {_TRIPLET_STATE16}) reads FP32 H")
+        raise ValueError(message)
     # H (post-door, pre-softmax) is exported only at the blocks a site follows; one buffer serves all three,
-    # because each site reads it before the next exporting block overwrites it.
-    logits = context.raw(_F32_BYTES * batch * shape.heads * _SQUARES * _SQUARES)
+    # because each site reads it before the next exporting block overwrites it. FP16 with v9's `h_f16` export.
+    logits = context.raw((_F16_BYTES if h16 else _F32_BYTES) * batch * shape.heads * _SQUARES * _SQUARES)
     # K2c "f16": the blocks read an FP16 copy of whichever state buffer is current; refreshed after every write.
     mode = _egt_state_mode(batch)
     copy_bytes = {"f16": _F16_BYTES, "f8": 1, "i8": 1}.get(mode, 0)  # r23b I8: one byte, like e4m3
     copy = context.raw(copy_bytes * egt.state_channels * cells) if copy_bytes and read_blocks else None  # r23b §7
     writes = 1 + len(sites)
-    v9 = _egt_v9_active(batch, shape)
     if v9:
-        _LOGGER.info("batch size %d: EGT2 attention v9 (CUBIN, cell-major FP16 state copy, %d SMs, control %r)", batch,
-                     _device_sms(), _EGT_V9_CONTROL)
+        _LOGGER.info("batch size %d: EGT2 attention v9 (CUBIN, cell-major FP16 state copy, %d SMs, control %r, H %s)", batch,
+                     _device_sms(), _EGT_V9_CONTROL, "f16" if h16 else "f32")
 
     def copy_specialization(write: int) -> object:
         # Round 26 C3: the scale of THIS write (the seed is write 0, the k-th site write k + 1).
@@ -1001,7 +1010,8 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
         body, codes = _encoder_egt(context, lab, body, edges, edge_norm, copy if copy is not None else state[current],
                                    edge_list, logits, index, export_h=index in sites, state=state[current],
                                    reads=index in read_blocks, body_codes=codes,  # r23b §7; Q1
-                                   copy_scales=_egt_copy_scales(mode, egt.state_channels, written, writes), v9=v9)
+                                   copy_scales=_egt_copy_scales(mode, egt.state_channels, written, writes), v9=v9,
+                                   h16=h16)
         if index in sites:
             # `rev_edge` (BT6-test): the site's FFN also reads the reverse edge through `ffn/dense1_rev/w`.
             reverse = sites[index].ffn_rev_weight is not None
@@ -1012,7 +1022,8 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
                 return EdgeSiteSpecialization(batch_count=batch, architecture=context.architecture, stage=stage,
                                               heads=shape.heads, states=egt.state_channels, hidden=egt.site_hidden,
                                               reverse=reverse and stage != "readback",
-                                              dot=_SITE_DOT if stage != "readback" else "ieee")
+                                              dot=_SITE_DOT if stage != "readback" else "ieee",
+                                              logits_f16=h16 and stage != "ffn")
 
             if sites[index].triplet is None:
                 # K3: e' = rms(e_hat + W2 relu(W1 rms(e_hat) + b1)), e_hat = e + O_e H, into the other state buffer.
@@ -1088,7 +1099,7 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
 def _encoder_egt(  # noqa: PLR0913
     context: _Context, lab: LabNetwork, body: Buffer, edges: Buffer, edge_norm: Buffer, edge_state: Buffer,
     edge_list: EgtEdgeList, logits: Buffer, index: int, *, export_h: bool, state: Buffer, reads: bool = True,
-    body_codes: Buffer | None = None, copy_scales: tuple[float, ...] | None = None, v9: bool = False,
+    body_codes: Buffer | None = None, copy_scales: tuple[float, ...] | None = None, v9: bool = False, h16: bool = False,
 ) -> tuple[Buffer, Buffer | None]:
     """One EGT2 encoder block: packed QKV, `attention_egt`, then the static residual branch, LN1, GLU FFN, LN2.
 
@@ -1144,6 +1155,9 @@ def _encoder_egt(  # noqa: PLR0913
         "accumulate_f16": _EGT_ACC == "f16", "state_math_f16": _EGT_STATE_MATH == "f16", "list_f16": _EGT_LIST_F16,
         "arithmetic_auto": _EGT_ARITH_AUTO,
     }
+    if h16 and export_h and not reads:
+        message = f"LC0EX_EGT_V9_H16=1: block {index} exports H but does not read the edge stream (Triton, FP32 H)"
+        raise NotImplementedError(message)
     if not reads:
         # r23b §7: this block does not read the edge stream. q.k and the four E terms stay; the edge read, door and
         # gate are compiled out of the head program, and neither the state nor its copy is loaded.
@@ -1184,8 +1198,8 @@ def _encoder_egt(  # noqa: PLR0913
             AttentionEgtV9Specialization(
                 batch_size=context.batch_size, heads=shape.heads, head_dim=shape.head_dim,
                 architecture=context.architecture, sms=_device_sms(), cap=edge.cap, output_gate=gated,
-                gate_scale=common["gate_scale"], export_h=export_h, quant_output=fused_codes, skew=_EGT_V9_SKEW,
-                control=_EGT_V9_CONTROL),
+                gate_scale=common["gate_scale"], export_h=export_h, h_f16=h16 and export_h, quant_output=fused_codes,
+                skew=_EGT_V9_SKEW, control=_EGT_V9_CONTROL),
             logits=logits if export_h else None, quant_prescale=attn_prescale,
         )
     else:
