@@ -118,6 +118,7 @@ def _edge_site_body(  # noqa: PLR0913
     dense1_bias,
     dense2_weight,
     dense1_reverse,
+    copy_out,
     batch_count: tl.constexpr,  # noqa: ARG001  # Autotune key and launch grid.
     heads: tl.constexpr,
     states: tl.constexpr,
@@ -129,6 +130,7 @@ def _edge_site_body(  # noqa: PLR0913
     tile_rows: tl.constexpr,
     dot_fp16: tl.constexpr = False,
     heads_pad: tl.constexpr = 0,
+    copy_cell_major: tl.constexpr = False,
 ) -> None:
     """Update the edge state of one run (or, with ``tile_rows``, one tile) of ``pixels`` cells of one sample.
 
@@ -183,6 +185,9 @@ def _edge_site_body(  # noqa: PLR0913
     if stage == _STAGE_READBACK:
         # K4 extension point: the triplet kernel adds its branch to this e_hat, then stage "ffn" runs.
         tl.store(output + state_offsets, values)
+        if copy_cell_major:
+            # `triplet_mma`'s input: e_hat FP16 cell-major, [B, 64, 64, states] (a cell's channels contiguous)
+            tl.store(copy_out + (sample * 4096 + cells[None, :]) * states + channels[:, None], values.to(tl.float16))
     else:
         units = tl.arange(0, hidden)
         weight1 = tl.load(dense1_weight + units[:, None] * states + channels[None, :])
@@ -206,7 +211,11 @@ def _edge_site_body(  # noqa: PLR0913
             values = tl.dot(weight2.to(tl.float16), activation.to(tl.float16), values)  # e_til
         else:
             values = tl.dot(weight2, activation, values, input_precision="ieee")  # e_til
-        tl.store(output + state_offsets, _rms_columns(values, states, epsilon))
+        e_new = _rms_columns(values, states, epsilon)
+        tl.store(output + state_offsets, e_new)
+        if copy_cell_major:
+            # v9's FP16 cell-major state copy of e', written here instead of by a separate cast after the site
+            tl.store(copy_out + (sample * 4096 + cells[None, :]) * states + channels[:, None], e_new.to(tl.float16))
 
 
 def _prune_site_configs(configs: list[triton.Config], named_args: dict[str, object], **kwargs: object) -> list[triton.Config]:
@@ -220,7 +229,7 @@ _edge_site_kernel = triton.autotune(
     configs=[triton.Config({"pixels": pixels, "tile_rows": 0}, num_warps=warps) for pixels, warps in _CONFIGURATIONS]
     + [triton.Config({"pixels": pixels, "tile_rows": rows}, num_warps=warps)
        for pixels, rows, warps in _TILE_CONFIGURATIONS],
-    key=["batch_count", "heads", "states", "hidden", "stage", "reverse", "dot_fp16"],
+    key=["batch_count", "heads", "states", "hidden", "stage", "reverse", "dot_fp16", "copy_cell_major"],
     prune_configs_by={"early_config_prune": _prune_site_configs},
     cache_results=True,
 )(_edge_site_body)
@@ -242,6 +251,9 @@ class EdgeSiteSpecialization:
     dot: str = "ieee"
     # H read as FP16 (attention v9's `h_f16` export); stages "site" and "readback" only.
     logits_f16: bool = False
+    # The output also written as an FP16 cell-major copy, the kernel's ninth pointer: stage "readback" writes e_hat's
+    # (`triplet_mma`'s input); stages "ffn" / "site" write e''s (v9's state copy, replacing `cast_state_cell_major`).
+    copy_cell_major: bool = False
 
     def __post_init__(self) -> None:
         """Reject widths a ``tl.arange`` tile cannot take."""
@@ -304,15 +316,16 @@ def compile_edge_site(specialization: EdgeSiteSpecialization) -> KernelArtifact:
     dense1_bias = torch.zeros(hidden, dtype=torch.float32, device="cuda")
     dense2_weight = torch.zeros((states, hidden), dtype=torch.float32, device="cuda")
     dense1_reverse = torch.zeros((hidden, states), dtype=torch.float32, device="cuda")
+    copy_out = torch.zeros((batch, 64, 64, states), dtype=torch.float16, device="cuda")
     compiled = _edge_site_kernel[_autotune_grid](
-        output, state, logits, readback, dense1_weight, dense1_bias, dense2_weight, dense1_reverse,
+        output, state, logits, readback, dense1_weight, dense1_bias, dense2_weight, dense1_reverse, copy_out,
         batch, heads, states, hidden, _STAGES[specialization.stage], EPSILON, specialization.reverse,
-        dot_fp16=specialization.dot == "fp16", heads_pad=_heads_pad(heads),
+        dot_fp16=specialization.dot == "fp16", heads_pad=_heads_pad(heads), copy_cell_major=specialization.copy_cell_major,
     )
     pixels = cast("int", _edge_site_kernel.best_config.kwargs["pixels"])
     parameters = tuple(
         _POINTER if used else _NULL_POINTER
-        for used in (*_STAGE_POINTERS[specialization.stage], specialization.reverse)
+        for used in (*_STAGE_POINTERS[specialization.stage], specialization.reverse, specialization.copy_cell_major)
     )
     return artifact_from_triton(
         compiled, grid=(batch * CELLS // pixels, 1, 1), parameters=parameters, autotuner=_edge_site_kernel,
@@ -329,6 +342,7 @@ def edge_site(  # noqa: PLR0913
     specialization: EdgeSiteSpecialization,
     *,
     after_block: int,
+    copy: Buffer | None = None,
 ) -> None:
     """Append one site call: ``output = e'`` (stage "site" or "ffn") or ``output = e_hat`` (stage "readback").
 
@@ -338,16 +352,19 @@ def edge_site(  # noqa: PLR0913
     if output is state:
         message = "the edge site writes e' to a separate buffer; output and state must differ"
         raise ValueError(message)
-    used = (*_STAGE_POINTERS[specialization.stage], specialization.reverse)
+    used = (*_STAGE_POINTERS[specialization.stage], specialization.reverse, specialization.copy_cell_major)
+    if (copy is not None) != specialization.copy_cell_major:
+        message = "the FP16 cell-major copy is passed exactly when the specialization has copy_cell_major"
+        raise ValueError(message)
     if (logits is not None) != used[2]:
         message = f"stage {specialization.stage!r} {'needs' if used[2] else 'takes no'} logits"
         raise ValueError(message)
     builder.set_target(lc0ex_pb2.Target.VENDOR_NVIDIA, f"sm_{specialization.architecture}")
     kernel = kernels.get(compile_edge_site, specialization)
     names = site_table_names(after_block, reverse=True)
-    pointers = (output, state, logits, *(tables.get(name) for name in names))
+    pointers = (output, state, logits, *(tables.get(name) for name in names), copy)
     arguments = tuple(buffer for buffer, needed in zip(pointers, used, strict=True) if needed)
     if any(buffer is None for buffer in arguments):
         message = f"stage {specialization.stage!r} (reverse={specialization.reverse}) is missing one of its tables"
         raise ValueError(message)
-    builder.call(kernel, *arguments, readonly=list(arguments[1:]))
+    builder.call(kernel, *arguments, readonly=[buffer for buffer in arguments[1:] if buffer is not copy])

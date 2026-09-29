@@ -24,7 +24,7 @@ import json
 import logging
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from lc0ex import Buffer, ExecutableBuilder, ProgramBuilder
 from lc0ex.proto import lc0ex_metadata_pb2, lc0ex_pb2, net_pb2
@@ -61,9 +61,11 @@ from lczero_triton.bt4.kernels.cutlass_matmul import (
     cutlass_supports,
 )
 from lczero_triton.bt4.kernels.quantise_operand import QuantiseOperandSpecialization, quantise_operand
+from lczero_triton.bt4.kernels.triplet_mma import TripletMmaSpecialization, triplet_mma
 from lczero_triton.bt4.kernels.triplet_site import (
     TripletSiteSpecialization,
     readback_table_name,
+    triplet_out,
     triplet_out_ffn,
     triplet_readback,
     triplet_site,
@@ -264,6 +266,15 @@ _TRIPLET_STATE16 = os.environ.get("LC0EX_TRIPLET_STATE16") == "1"
 # Form "fused" only. LC0EX_TRIPLET_OUT_FFN=1 folds the triplet's `out` into K3's FFN stage (`triplet_out_ffn`,
 # K4b step c): e_hat2 never reaches memory and the site closes in one planar launch.
 _TRIPLET_OUT_FFN = os.environ.get("LC0EX_TRIPLET_OUT_FFN") == "1"
+# LC0EX_TRIPLET_MMA=1 (backend 09-29, `triplet_mma`): on a v9 rung, form "fused"'s stage runs on the tensor cores as a CUBIN. The
+# readback also writes e_hat as an FP16 cell-major copy into v9's state-copy buffer (free between the readback and the site's
+# copy refresh), `triplet_mma` reads it and writes va in FP16, and `out` reads that. Needs form "fused" without state16 / out_ffn.
+_TRIPLET_MMA = os.environ.get("LC0EX_TRIPLET_MMA", "0") == "1"
+# LC0EX_TRIPLET_MMA_CONTROL=no_swap builds the triplet gate's CONTROL (must fail; no_door_bias is too mild).
+_TRIPLET_MMA_CONTROL = os.environ.get("LC0EX_TRIPLET_MMA_CONTROL", "")
+# LC0EX_EGT_V9_FFN_COPY=1: on a v9 rung the site's last stage (edge site "ffn" or "site") also writes v9's FP16 cell-major state
+# copy of e', instead of a separate `cast_state_cell_major` after the site (the same bits). Not with LC0EX_TRIPLET_OUT_FFN.
+_EGT_V9_FFN_COPY = os.environ.get("LC0EX_EGT_V9_FFN_COPY", "0") == "1"
 # r23b §7 (pricing): which EGT2 blocks read the edge stream. The exported family reads it in every block; this serves
 # the net that reads it only in the named blocks -- elsewhere the head program's state terms are compiled out, exact
 # for a net whose read, door and gate weights and gate bias are zero there. "all" (default, unchanged), "none",
@@ -976,6 +987,15 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
         message = (f"LC0EX_EGT_V9_H16=1 needs the edge site's readback; LC0EX_TRIPLET_FORM={_TRIPLET_FORM!r} "
                    f"(state16 {_TRIPLET_STATE16}) reads FP32 H")
         raise ValueError(message)
+    mma = v9 and _TRIPLET_MMA and any(site.triplet is not None for site in egt.sites)
+    ffn_copy = v9 and _EGT_V9_FFN_COPY
+    if ffn_copy and _TRIPLET_OUT_FFN and any(site.triplet is not None for site in egt.sites):
+        message = "LC0EX_EGT_V9_FFN_COPY=1 writes the copy from the edge site's FFN stage; LC0EX_TRIPLET_OUT_FFN replaces it"
+        raise ValueError(message)
+    if mma and (_TRIPLET_FORM != "fused" or _TRIPLET_STATE16 or _TRIPLET_OUT_FFN):
+        message = (f"LC0EX_TRIPLET_MMA=1 replaces form 'fused''s stage; got LC0EX_TRIPLET_FORM={_TRIPLET_FORM!r}, "
+                   f"state16 {_TRIPLET_STATE16}, out_ffn {_TRIPLET_OUT_FFN}")
+        raise ValueError(message)
     # H (post-door, pre-softmax) is exported only at the blocks a site follows; one buffer serves all three,
     # because each site reads it before the next exporting block overwrites it. FP16 with v9's `h_f16` export.
     logits = context.raw((_F16_BYTES if h16 else _F32_BYTES) * batch * shape.heads * _SQUARES * _SQUARES)
@@ -985,8 +1005,8 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
     copy = context.raw(copy_bytes * egt.state_channels * cells) if copy_bytes and read_blocks else None  # r23b §7
     writes = 1 + len(sites)
     if v9:
-        _LOGGER.info("batch size %d: EGT2 attention v9 (CUBIN, cell-major FP16 state copy, %d SMs, control %r, H %s)", batch,
-                     _device_sms(), _EGT_V9_CONTROL, "f16" if h16 else "f32")
+        _LOGGER.info("batch size %d: EGT2 attention v9 (CUBIN, cell-major FP16 state copy, %d SMs, control %r, H %s, triplet %s)",
+                     batch, _device_sms(), _EGT_V9_CONTROL, "f16" if h16 else "f32", "mma" if mma else "triton")
 
     def copy_specialization(write: int) -> object:
         # Round 26 C3: the scale of THIS write (the seed is write 0, the k-th site write k + 1).
@@ -1017,18 +1037,19 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
             reverse = sites[index].ffn_rev_weight is not None
             site_tables = {name: context.weight(name) for name in site_table_names(index, reverse=reverse)}
 
-            def site_specialization(stage: str) -> EdgeSiteSpecialization:
+            def site_specialization(stage: str, *, copy_cell_major: bool = False) -> EdgeSiteSpecialization:
                 # The readback stage runs no FFN, so it is the same kernel with or without the reverse edge.
                 return EdgeSiteSpecialization(batch_count=batch, architecture=context.architecture, stage=stage,
                                               heads=shape.heads, states=egt.state_channels, hidden=egt.site_hidden,
                                               reverse=reverse and stage != "readback",
                                               dot=_SITE_DOT if stage != "readback" else "ieee",
-                                              logits_f16=h16 and stage != "ffn")
+                                              logits_f16=h16 and stage != "ffn", copy_cell_major=copy_cell_major)
 
             if sites[index].triplet is None:
                 # K3: e' = rms(e_hat + W2 relu(W1 rms(e_hat) + b1)), e_hat = e + O_e H, into the other state buffer.
                 edge_site(context.builder, context.kernels, state[1 - current], state[current], logits, site_tables,
-                          site_specialization("site"), after_block=index)
+                          site_specialization("site", copy_cell_major=ffn_copy), after_block=index,
+                          copy=copy if ffn_copy else None)
                 current = 1 - current
             else:
                 # K5: K3's split form around K4's operator. readback writes e_hat to the other buffer, the triplet
@@ -1043,7 +1064,19 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
                 )
                 triplet_tables = {name: context.weight(name) for name in triplet_table_names(index)}
                 scratch = triplet_buffer_bytes(triplet_specialization)
-                if _TRIPLET_FORM == "readback_prep":
+                if mma:
+                    # `triplet_mma`: the readback also writes e_hat FP16 cell-major into `copy` (v9's state copy, refreshed
+                    # after this site), the CUBIN writes va FP16, `out` adds W_o va into e_hat in place.
+                    edge_site(context.builder, context.kernels, state[1 - current], state[current], logits, site_tables,
+                              site_specialization("readback", copy_cell_major=True), after_block=index, copy=copy)
+                    va_buffer = context.raw(_F16_BYTES * 2 * egt.state_channels * cells)
+                    triplet_mma(context.builder, context.kernels, va_buffer, copy, triplet_tables,
+                                TripletMmaSpecialization(batch, context.architecture, triplet.contraction, va_f16=True,
+                                                         control=_TRIPLET_MMA_CONTROL),
+                                after_block=index)
+                    triplet_out(context.builder, context.kernels, state[1 - current], va_buffer, triplet_tables,
+                                replace(triplet_specialization, va_f16=True), after_block=index)
+                elif _TRIPLET_FORM == "readback_prep":
                     # (a): K3's readback fused into K4's prep; e_hat goes to the other buffer as before.
                     triplet_site_with_readback(
                         context.builder, context.kernels, state[1 - current], state[current], logits,
@@ -1080,9 +1113,10 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
                                         after_block=index)
                 if not (fused and _TRIPLET_OUT_FFN):
                     edge_site(context.builder, context.kernels, state[current], state[1 - current], None,
-                              site_tables, site_specialization("ffn"), after_block=index)
+                              site_tables, site_specialization("ffn", copy_cell_major=ffn_copy), after_block=index,
+                              copy=copy if ffn_copy else None)
             written += 1
-            if copy is not None:
+            if copy is not None and not ffn_copy:
                 write_copy(context.builder, context.kernels, copy, state[current], copy_specialization(written))
     if lab.final_norm is not None and _FINAL_NORM_CONTROL != "skip":
         # O: the pre-norm tower is normed once, here, before every head (as `_network`).

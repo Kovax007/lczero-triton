@@ -431,7 +431,8 @@ def _triplet_out_body(  # noqa: PLR0913
     channels = tl.arange(0, states)
     wide = tl.arange(0, 2 * states)
     planes = channels[:, None] * 4096 + cells[None, :]
-    branch = tl.load(values + sample * 2 * states * 4096 + wide[:, None] * 4096 + cells[None, :])
+    # FP32 va, or FP16 (`va_f16`: `triplet_mma`'s FP16 store) widened here; the dot stays IEEE FP32
+    branch = tl.load(values + sample * 2 * states * 4096 + wide[:, None] * 4096 + cells[None, :]).to(tl.float32)
     weight = tl.load(output_weight + channels[:, None] * 2 * states + wide[None, :])
     current = tl.load(state + sample * states * 4096 + planes)
     tl.store(state + sample * states * 4096 + planes,
@@ -556,6 +557,8 @@ class TripletSiteSpecialization:
     state_f16: bool = False
     # The site FFN's hidden width (K3's `hidden`), read by `out_ffn` (K4b c) only.
     site_hidden: int = SITE_HIDDEN
+    # `out` reads va as FP16 (`triplet_mma` with `va_f16`); form "fused" only.
+    va_f16: bool = False
 
     def __post_init__(self) -> None:
         """Reject widths a ``tl.arange`` tile cannot take, and a value width the two directions cannot fill."""
@@ -582,6 +585,9 @@ class TripletSiteSpecialization:
             raise ValueError(message)
         if self.dot not in _DOTS:
             message = f"unknown dot {self.dot!r}; expected one of {sorted(_DOTS)}"
+            raise ValueError(message)
+        if self.va_f16 and self.form != "fused":
+            message = "va_f16 (FP16 va from triplet_mma) belongs to form 'fused'"
             raise ValueError(message)
         if self.form != "fused" and (self.dot != "ieee" or self.state_f16):
             message = "dot='fp16' and state_f16 belong to form 'fused'"
@@ -746,8 +752,9 @@ def compile_triplet_fused(specialization: TripletSiteSpecialization) -> KernelAr
 def compile_triplet_out(specialization: TripletSiteSpecialization) -> KernelArtifact:
     """Autotune and compile the output projection that adds the branch into e_hat."""
     tensors = _inputs(specialization)
+    values = tensors["values"].half() if specialization.va_f16 else tensors["values"]
     compiled = _triplet_out_kernel[_planar_grid](
-        tensors["state"], tensors["values"], tensors["output_weight"], specialization.batch_count,
+        tensors["state"], values, tensors["output_weight"], specialization.batch_count,
         specialization.states,
     )
     pixels = cast("int", _triplet_out_kernel.best_config.kwargs["pixels"])
@@ -810,6 +817,18 @@ def _append_out(  # noqa: PLR0913
 ) -> None:
     builder.call(kernels.get(compile_triplet_out, specialization), state, va, output_weight,
                  readonly=[va, output_weight])
+
+
+def triplet_out(  # noqa: PLR0913
+    builder: ProgramBuilder, kernels: KernelCache, state: Buffer, va: Buffer, tables: Mapping[str, Buffer],
+    specialization: TripletSiteSpecialization, *, after_block: int,
+) -> None:
+    """Append `out` alone: ``state`` (e_hat) += ``W_o va`` in place, ``va`` FP32 or (`va_f16`) FP16 (after `triplet_mma`)."""
+    if va is state:
+        message = "triplet_out needs distinct buffers: the edge state and va"
+        raise ValueError(message)
+    _set_target(builder, specialization)
+    _append_out(builder, kernels, state, va, tables[triplet_table_names(after_block)[3]], specialization)
 
 
 def triplet_site(  # noqa: PLR0913
