@@ -138,6 +138,7 @@ from lczero_triton.bt4.kernels.prologue_egt import (
     prologue_egt,
 )
 from lczero_triton.bt4.kernels.prologue_static import PrologueStaticSpecialization, prologue_static
+from lczero_triton.bt4.kernels.sigmoid_dot import SigmoidDotSpecialization, sigmoid_dot
 from lczero_triton.bt4.kernels.promotion_logits import (
     PromotionLogitsSpecialization,
     promotion_logits,
@@ -282,6 +283,30 @@ _EGT_V9_FFN_COPY = os.environ.get("LC0EX_EGT_V9_FFN_COPY", "0") == "1"
 # "3,4,9".
 _EGT_READ_BLOCKS = os.environ.get("LC0EX_EGT_READ_BLOCKS", "all")
 _EGT_NO_READ_TERMS = EGT_FULL & ~EGT_STATE_TERMS
+# Error head output on the lab path (backend 10-13). LC0EX_LAB_ERROR_HEAD=1 appends, after the three served heads, the
+# ERROR output of one value head of the net as a fourth program output `/output/err`, [batch, 1] FP32 in 0..1: the head's
+# predicted squared error of its own q, which the uncertainty weighting of lc0's TCEC season-30 search reads
+# (`dag_classic/search.cc`: weight = min(base + scale / (1 + exp(minus_r * (sqrt(e) - mid))), cap); its default error
+# head is the flagship's `st`). The graph is lc0's (`converter.cc`, error_head != value_head): the error head's OWN
+# value-head body on the tensor every value head reads -- per-square embedding with Mish, flatten, dense1 with Mish, the
+# kernels `_dense_head` uses for `/value`, so no dense kernel is compiled or tuned anew -- then the 128 -> 1 error layer
+# and a sigmoid (`bt4/kernels/sigmoid_dot.py`, the one new kernel).
+# The lab reader never sees the head: its six weights are declared here under `/value_error/` (FP16, the shapes of the
+# `/value` head with a 1-wide last layer) and reach the weights file from an export that carries `/output/err`
+# (`tools/make_lab_error_head_carrier.py`). WHICH head's error output is served is decided by that file alone; the
+# program is bound to the shape. The fingerprint is NOT changed (it mirrors lc0's `BuildNetworkFingerprint`, which knows
+# no error head): a program with the output refuses a weights file without the six tensors through the runtime's own
+# check ("The lc0ex buffer '/value_error/...' has no corresponding ONNX initializer"), and a program without the
+# output loads a file that carries them (a warning per tensor).
+# Unset or 0 = no error output: no kernel of the head is imported into the graph and the builder emits exactly what it
+# emitted before.
+_LAB_ERROR_HEAD = os.environ.get("LC0EX_LAB_ERROR_HEAD", "0")
+if _LAB_ERROR_HEAD not in ("0", "1"):
+    message = f"LC0EX_LAB_ERROR_HEAD={_LAB_ERROR_HEAD!r}; expected unset, 0 or 1"
+    raise ValueError(message)
+ERROR_HEAD_PREFIX = "/value_error"
+ERROR_HEAD_OUTPUT = "/output/err"
+_ERROR_HEAD_WIDTH = 128
 
 
 def _egt_v9_active(batch: int, shape: object) -> bool:
@@ -395,6 +420,8 @@ class _Context:
     d1: bool = False
     # Round 26: the quantised norms whose vector file carries an offset `m` (none on the flagship's recipe).
     quant_offset_norms: frozenset[str] = frozenset()
+    # LC0EX_LAB_ERROR_HEAD: this build serves `/output/err` (the six `/value_error/` weights are in `plans`).
+    error_head: bool = False
 
     @property
     def rows(self) -> int:
@@ -501,6 +528,14 @@ def build(
         # export still raises, because K4 is not built.
         _check_egt_supported(lab)
     plans = {plan.name: plan for plan in plan_network(lab)}
+    if _LAB_ERROR_HEAD == "1":
+        for plan in error_head_plans(lab.architecture.d_model, lab.architecture.tokens):
+            if plan.name in plans:
+                message = f"error head: the net's own plan already has a buffer {plan.name}"
+                raise ValueError(message)
+            plans[plan.name] = plan
+        _LOGGER.info("error head (LC0EX_LAB_ERROR_HEAD=1): %s = sigmoid(dense2(mish(dense1(mish(embedding(body)))))), "
+                     "weights %s", ERROR_HEAD_OUTPUT, sorted(name for name in plans if name.startswith(ERROR_HEAD_PREFIX)))
     kernels = KernelCache(builder)
     shape = lab.architecture
     _LOGGER.info(
@@ -525,6 +560,7 @@ def build(
                                                  in quantised_norms(lab.architecture)),
                            int8_blocks=int8_blocks(lab.architecture), d1=bool(quant_d1_source()),
                            quant_offset_norms=_quant_offset_norms(lab))
+        context.error_head = _LAB_ERROR_HEAD == "1"
         if context.int8_blocks and lab.egt is None:
             message = "LC0EX_QUANT_GEMM=int8 is wired for the EGT2 family (the flagship) only"
             raise NotImplementedError(message)
@@ -534,6 +570,46 @@ def build(
             _network(context, lab)
         _LOGGER.info("finished program %s", name)
     builder.set_metadata(network_fingerprint(network).SerializeToString(deterministic=True))
+
+
+def error_head_plans(trunk_width: int, tokens: int) -> list[BufferPlan]:
+    """The six FP16 weights of the error value head: the `/value` head's shapes with a 1-wide last layer.
+
+    Their values come from the weights file (`tools/make_lab_error_head_carrier.py`, which repeats these names and
+    shapes and checks them against the export it reads); no source tensor of the lab reader is named.
+    """
+    width = _ERROR_HEAD_WIDTH
+    shapes = {
+        "embedding/w": (trunk_width, width), "embedding/b": (width,),
+        "dense1/w": (tokens * width, width), "dense1/b": (width,),
+        "dense2/w": (width, 1), "dense2/b": (1,),
+    }
+    return [BufferPlan(name=f"{ERROR_HEAD_PREFIX}/{name}", shape=shape, data_type=_onnx.FLOAT16, source="copy",
+                       tensors=()) for name, shape in shapes.items()]
+
+
+def _error_head(context: _Context, body: Buffer) -> None:
+    """`/output/err` = sigmoid(error(mish(dense1(flatten(mish(embedding(body))))))): a value head's error output.
+
+    The first two layers are `_dense_head`'s for `/value` (the same `matmul` specializations, so the same compiled
+    kernels); the last is `sigmoid_dot`, FP32.
+    """
+    prefix, width = ERROR_HEAD_PREFIX, _ERROR_HEAD_WIDTH
+    trunk = context.plans[f"{prefix}/embedding/w"].shape[0]
+    batch, rows = context.batch_size, context.rows
+    embedded = context.temporary(rows * width)
+    _projection(context, embedded, body, f"{prefix}/embedding", rows, width, trunk, use_cutlass=False,
+                activation="mish")
+    hidden = context.temporary(batch * width)
+    _projection(context, hidden, embedded, f"{prefix}/dense1", batch, width, _SQUARES * width,
+                use_cutlass=False, activation="mish")
+    output = context.builder.buffer(
+        name=ERROR_HEAD_OUTPUT, shape=(batch, 1), dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32, writable=True,
+    )
+    sigmoid_dot(
+        context.builder, context.kernels, output, hidden, context.weight(f"{prefix}/dense2/w"),
+        context.weight(f"{prefix}/dense2/b"), SigmoidDotSpecialization(batch, width, context.architecture),
+    )
 
 
 def _quant_offset_norms(lab: LabNetwork) -> frozenset[str]:
@@ -584,6 +660,9 @@ def _network(context: _Context, lab: LabNetwork) -> None:
                 output_width=3, final_activation="none")
     _dense_head(context, body, "/moves", hidden_width=128, square_width=8, output_name="/output/mlh",
                 output_width=1, final_activation="relu")
+    if context.error_head:
+        # LC0EX_LAB_ERROR_HEAD=1: the error value head reads `body`, what `/value` and `/moves` read above.
+        _error_head(context, body)
 
 
 def _cutlass_fits(prefix: str, out_width: int, in_width: int) -> bool:
@@ -1128,6 +1207,9 @@ def _network_egt(context: _Context, lab: LabNetwork) -> None:
                 output_width=3, final_activation="none")
     _dense_head(context, body, "/moves", hidden_width=128, square_width=8, output_name="/output/mlh",
                 output_width=1, final_activation="relu")
+    if context.error_head:
+        # LC0EX_LAB_ERROR_HEAD=1: the error value head reads `body`, what `/value` and `/moves` read above.
+        _error_head(context, body)
 
 
 def _encoder_egt(  # noqa: PLR0913
