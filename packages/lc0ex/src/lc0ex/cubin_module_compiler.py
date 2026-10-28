@@ -7,6 +7,7 @@ nvcc from CUTLASS sources. This module is the other half of
 compiler cannot infer, and produces the same `KernelArtifact`.
 """
 
+import os
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
@@ -52,15 +53,18 @@ def compile_cuda(
     *,
     architecture: str,
     include_directories: Sequence[Path | str] = (),
-    nvcc: Path | str = "/usr/local/cuda-12.9/bin/nvcc",
+    nvcc: Path | str | None = None,
     extra_arguments: Sequence[str] = (),
 ) -> bytes:
     """Compile one CUDA translation unit to a CUBIN for *architecture*.
 
     `architecture` is the same `sm_XX` string the artifact target carries. The
     default nvcc is pinned rather than taken from PATH: sm_89 FP8 needs 12.4 or
-    newer, and PATH may point at an older toolkit.
+    newer, and PATH may point at an older toolkit. The pin is `$CUDA_HOME/bin/nvcc`,
+    else /usr/local/cuda-12.9.
     """
+    if nvcc is None:
+        nvcc = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda-12.9")) / "bin" / "nvcc"
     with TemporaryDirectory(prefix="lc0ex-cuda-") as directory:
         source_path = Path(directory) / "module.cu"
         cubin_path = source_path.with_suffix(".cubin")

@@ -40,7 +40,7 @@ _WARP_SIZE = 32
 _STATIC_SHARED_LIMIT = 48 * 1024
 # The hard per-block ceiling on sm_89 (and, unchanged, on sm_120).
 _DYNAMIC_SHARED_LIMIT = 99 * 1024
-_NVCC = Path("/usr/local/cuda-12.9/bin/nvcc")
+_NVCC = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda-12.9")) / "bin" / "nvcc"
 
 CUTLASS_INCLUDE = Path.home() / "spsa" / "cutlass" / "include"
 
