@@ -74,8 +74,8 @@ class AttentionEgtV9Specialization:
     # B9's gated arithmetic class: FP16 accumulate in the MMAs; 2 sigmoid(x) = 1 + tanh.approx(x / 2).
     accumulate_f16: bool = True
     gate_tanh: bool = True
-    # The odd head slots start this many cycles late so that the pipes overlap (measured best on the 4090).
-    skew: int = 6000
+    # Odd head slots start this many cycles late so the pipes overlap.
+    skew: int = 4500
     control: str = ""
     # The FP16 packs of `pack_egt_v9_tables` (the served form); False reads the FP32 plans in the kernel (a test switch).
     packed: bool = True

@@ -242,7 +242,7 @@ _EGT_ARITH_AUTO = os.environ.get("LC0EX_EGT_ARITH", "fixed") == "auto"
 _EGT_V9 = os.environ.get("LC0EX_EGT_V9", "0") == "1"
 _EGT_V9_MIN_BATCH = int(os.environ.get("LC0EX_EGT_V9_MIN_BATCH", "32"))
 _EGT_V9_CONTROL = os.environ.get("LC0EX_EGT_V9_CONTROL", "")
-_EGT_V9_SKEW = int(os.environ.get("LC0EX_EGT_V9_SKEW", "6000"))
+_EGT_V9_SKEW = int(os.environ.get("LC0EX_EGT_V9_SKEW", "4500"))
 # LC0EX_EGT_V9_H16=1 (step 3): v9 exports H in FP16 and the edge sites read it so (half the H bytes of the export and the
 # readback). The site readback must be `edge_site`'s: triplet forms "readback_prep" and "fused" + state16 read FP32 H.
 _EGT_V9_H16 = os.environ.get("LC0EX_EGT_V9_H16", "0") == "1"

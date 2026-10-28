@@ -148,6 +148,20 @@ __device__ __forceinline__ uint32_t table_pair(const float* __restrict__ table, 
 }
 #endif
 
+// One 16-byte load per lane; quad_words transposes so lane t holds words t, 4 + t, 8 + t, 12 + t.
+__device__ __forceinline__ uint4 row_load(const __half* row, int t) { return __ldg(reinterpret_cast<const uint4*>(row) + t); }
+__device__ __forceinline__ void quad_words(uint4 v, int t, uint32_t (&w)[4]) {
+  uint32_t p[4] = {v.x, v.y, v.z, v.w};
+  const bool b1 = t & 2, b0 = t & 1;
+  uint32_t x0 = __shfl_xor_sync(0xffffffffu, b1 ? p[0] : p[2], 2);
+  uint32_t x1 = __shfl_xor_sync(0xffffffffu, b1 ? p[1] : p[3], 2);
+  if (b1) { p[0] = x0; p[1] = x1; } else { p[2] = x0; p[3] = x1; }
+  x0 = __shfl_xor_sync(0xffffffffu, b0 ? p[0] : p[1], 1);
+  x1 = __shfl_xor_sync(0xffffffffu, b0 ? p[2] : p[3], 1);
+  if (b0) { p[0] = x0; p[2] = x1; } else { p[1] = x0; p[3] = x1; }
+  w[0] = p[0]; w[1] = p[1]; w[2] = p[2]; w[3] = p[3];
+}
+
 }  // namespace
 
 extern "C" __global__ void __launch_bounds__(kThreads, 1) egt_v9_attention(
@@ -221,25 +235,13 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) egt_v9_attention(
     const __half* base = qkv + (size_t)sample * 64 * kStride + h * kHd;
 
     // ---- loads for q.k and the tables, all issued ahead of the MMAs
-    uint32_t qa[kKs][4];
-    const __half* qrow = base + (size_t)(row0 + rt * 16 + g) * kStride + 2 * t;
+    static_assert(kHd == 32 && kKs == 2 && kNd == 4, "ld128 is written for head_dim 32");
+    const __half* qrow = base + (size_t)(row0 + rt * 16 + g) * kStride;
+    const uint4 qraw0 = row_load(qrow, t), qraw1 = row_load(qrow + 8 * kStride, t);
+    uint4 kraw[4];  // keys kh * 32 + 8n + g
 #pragma unroll
-    for (int ks = 0; ks < kKs; ++ks) {
-      qa[ks][0] = ld32(qrow + 16 * ks);
-      qa[ks][1] = ld32(qrow + 8 * kStride + 16 * ks);
-      qa[ks][2] = ld32(qrow + 16 * ks + 8);
-      qa[ks][3] = ld32(qrow + 8 * kStride + 16 * ks + 8);
-    }
-    uint32_t kb[4][kKs][2];  // keys kh * 32 + 8n + g
-#pragma unroll
-    for (int n = 0; n < 4; ++n) {
-      const __half* krow = base + kWidth + (size_t)(kh * 32 + 8 * n + g) * kStride + 2 * t;
-#pragma unroll
-      for (int ks = 0; ks < kKs; ++ks) {
-        kb[n][ks][0] = ld32(krow + 16 * ks);
-        kb[n][ks][1] = ld32(krow + 16 * ks + 8);
-      }
-    }
+    for (int n = 0; n < 4; ++n) kraw[n] = row_load(base + kWidth + (size_t)(kh * 32 + 8 * n + g) * kStride, t);
+
     uint32_t tqf[3][kKs][2], tkf[3][kKs][2];
 #pragma unroll
     for (int i = 0; i < 3; ++i) {
@@ -260,6 +262,22 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) egt_v9_attention(
       }
     }
 
+    // Transpose once every load of this unit is in flight.
+    uint32_t qa[kKs][4];
+    {
+      uint32_t w0[4], w1[4];
+      quad_words(qraw0, t, w0);
+      quad_words(qraw1, t, w1);
+      qa[0][0] = w0[0]; qa[0][2] = w0[1]; qa[1][0] = w0[2]; qa[1][2] = w0[3];
+      qa[0][1] = w1[0]; qa[0][3] = w1[1]; qa[1][1] = w1[2]; qa[1][3] = w1[3];
+    }
+    uint32_t kb[4][kKs][2];
+#pragma unroll
+    for (int n = 0; n < 4; ++n) {
+      uint32_t w[4];
+      quad_words(kraw[n], t, w);
+      kb[n][0][0] = w[0]; kb[n][0][1] = w[1]; kb[n][1][0] = w[2]; kb[n][1][1] = w[3];
+    }
     // ---- q.k and this warp's share of the head's E tables: row table (its 16 rows; channel tiles 0-2 or 3-4 by key half) and
     // column table (its 32 keys, whose A fragments are its K fragments; channel tiles 0-2 or 3-4 by row tile)
     Acc s[4];
@@ -452,15 +470,12 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) egt_v9_attention(
     // ---- the logit assembly per cell: E entries, norm * cbias, read / door / gate from the shared state (HFMA2),
     // H = (F + read)(1 + door)
     // V for P.V, loaded now so its latency hides under the assembly (transposed at use)
-    const __half* vrow = base + 2 * kWidth + (size_t)(kh * 32 + g) * kStride + 2 * t;
-    uint32_t vraw[kNd][2][2];
+    const __half* vrow = base + 2 * kWidth + (size_t)(kh * 32 + g) * kStride;
+    uint4 vload[2][2];  // rows kh * 32 + g + 16 kk + 8 j, transposed into fragment words just before P.V
 #pragma unroll
-    for (int nd = 0; nd < kNd; ++nd)
+    for (int kk = 0; kk < 2; ++kk)
 #pragma unroll
-      for (int kk = 0; kk < 2; ++kk) {
-        vraw[nd][kk][0] = ld32(vrow + (size_t)(16 * kk) * kStride + 8 * nd);
-        vraw[nd][kk][1] = ld32(vrow + (size_t)(16 * kk + 8) * kStride + 8 * nd);
-      }
+      for (int j = 0; j < 2; ++j) vload[kk][j] = row_load(vrow + (size_t)(16 * kk + 8 * j) * kStride, t);
     const bool walk = eover;  // the half-position's bits did not fit the list: every lane reads its cells' masks
 #ifndef DBG_NO_E
     if (!walk) {  // this head's E values: 4 consecutive entries per head thread, then an FP32 prefix over the list
@@ -498,6 +513,54 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) egt_v9_attention(
     int cell_start = estart;  // running start of cell k's entries
     float hv[4][4];
     __half2 dg[4][4];  // (door, 2 sigmoid(gate)) per cell
+    // The rare overflow half-position takes the copy below.
+    if (!walk) {
+#pragma unroll
+    for (int a = 0; a < 2; ++a) {
+      const int rl = rt * 16 + g + 8 * a;
+#pragma unroll
+      for (int n = 0; n < 4; ++n) {
+        const float2 nr = __half22float2(nrm[a][n]), cbf = __half22float2(cb[a][n]);
+#pragma unroll
+        for (int b = 0; b < 2; ++b) {
+          const int k = a * 8 + n * 2 + b, key = kh * 32 + 8 * n + 2 * t + b;
+#ifdef DBG_NO_STATE  // pricing switches (results wrong): drop one term
+          const uint4 c0 = make_uint4(0, 0, 0, 0), c1 = c0;
+#else
+          const uint4 c0 = *reinterpret_cast<const uint4*>(sS + rl * kSPitch + key * 16);
+          const uint4 c1 = *reinterpret_cast<const uint4*>(sS + kPlane + rl * kSPitch + key * 16);
+#endif
+          const __half2* x0 = reinterpret_cast<const __half2*>(&c0);
+          const __half2* x1 = reinterpret_cast<const __half2*>(&c1);
+          __half2 ar = __float2half2_rn(0.f), ad = ar, ag = ar;
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            ar = __hfma2(x0[i], wr[i], ar);
+            ad = __hfma2(x0[i], wd[i], ad);
+            ag = __hfma2(x0[i], wg[i], ag);
+            ar = __hfma2(x1[i], wr[4 + i], ar);
+            ad = __hfma2(x1[i], wd[4 + i], ad);
+            ag = __hfma2(x1[i], wg[4 + i], ag);
+          }
+          const float nb = b ? nr.y : nr.x;
+          const int cnt = static_cast<int>((counts >> (4 * k)) & 15u);
+#ifdef DBG_NO_E
+          hv[n][2 * a + b] = 0.f;
+#else
+          hv[n][2 * a + b] = cnt ? sP[cell_start + cnt - 1] - (cell_start ? sP[cell_start - 1] : 0.f) : 0.f;
+#endif
+          cell_start += cnt;
+          hv[n][2 * a + b] += elem(s[n], 2 * a + b) * qk_scale + nb * (b ? cbf.y : cbf.x) + hsum(ar);
+          const float x = hsum(ag) + gate_b;
+#if CAP
+          dg[n][2 * a + b] = __floats2half2_rn(hsum(ad), x >= 0.f ? 1.f : two_sigmoid(x));
+#else
+          dg[n][2 * a + b] = __floats2half2_rn(hsum(ad), two_sigmoid(x));
+#endif
+        }
+      }
+    }
+    } else {
 #pragma unroll
     for (int a = 0; a < 2; ++a) {
       const int rl = rt * 16 + g + 8 * a;
@@ -553,6 +616,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) egt_v9_attention(
 #endif
         }
       }
+    }
     }
 #pragma unroll
     for (int a = 0; a < 2; ++a) {
@@ -638,6 +702,16 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) egt_v9_attention(
       pa[kk][2] = pack(hv[2 * kk + 1][0], hv[2 * kk + 1][1]);
       pa[kk][3] = pack(hv[2 * kk + 1][2], hv[2 * kk + 1][3]);
     }
+    uint32_t vraw[kNd][2][2];
+#pragma unroll
+    for (int kk = 0; kk < 2; ++kk)
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        uint32_t w[4];
+        quad_words(vload[kk][j], t, w);
+#pragma unroll
+        for (int nd = 0; nd < kNd; ++nd) vraw[nd][kk][j] = w[nd];
+      }
     Acc o[kNd];
 #pragma unroll
     for (int nd = 0; nd < kNd; ++nd) {
