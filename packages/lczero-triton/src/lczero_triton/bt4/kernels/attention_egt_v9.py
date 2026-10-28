@@ -212,17 +212,77 @@ def compile_pack_egt_v9_tables(specialization: PackEgtV9Specialization) -> Kerne
     return artifact_from_triton(compiled, grid=(heads, 1, 1), parameters=(_POINTER,) * 10, autotuner=_pack_tables_kernel)
 
 
+# The same pack, run once per head: `done` is a persistent FP32 [heads] the loader zeroes.
+@triton.autotune(configs=[triton.Config({}, num_warps=warps) for warps in (4, 8)], key=["heads", "depth"], cache_results=True,
+                 restore_value=["done"])
+@triton.jit
+def _pack_tables_once_kernel(  # noqa: PLR0913
+    query16, key16, weights16, cbias16, query, key, read, door, gate, cbias, done,
+    heads: tl.constexpr,  # noqa: ARG001  # Autotune key and launch grid.
+    depth: tl.constexpr,
+) -> None:
+    """`_pack_tables_kernel`, skipped once this head's flag in `done` is set; sets it."""
+    head = tl.program_id(0)
+    go = tl.load(done + head) == 0.0
+    channel = tl.arange(0, 64)[:, None]
+    dim = tl.arange(0, depth)[None, :]
+    source = (head * 34 + channel) * depth + dim
+    target = (head * 40 + channel) * depth + dim
+    real, stored = (channel < 34) & go, (channel < 40) & go
+    tl.store(query16 + target, tl.load(query + source, mask=real, other=0.0).to(tl.float16), mask=stored)
+    tl.store(key16 + target, tl.load(key + source, mask=real, other=0.0).to(tl.float16), mask=stored)
+    state = tl.arange(0, 16)
+    live = (state < 16) & go
+    tl.store(weights16 + head * 48 + state, tl.load(read + head * 16 + state, mask=live).to(tl.float16), mask=live)
+    tl.store(weights16 + head * 48 + 16 + state, tl.load(door + head * 16 + state, mask=live).to(tl.float16), mask=live)
+    tl.store(weights16 + head * 48 + 32 + state, tl.load(gate + head * 16 + state, mask=live).to(tl.float16), mask=live)
+    cells = tl.arange(0, 4096)
+    every = (cells < 4096) & go
+    tl.store(cbias16 + head * 4096 + cells, tl.load(cbias + head * 4096 + cells, mask=every).to(tl.float16), mask=every)
+    tl.store(done + head, 1.0)
+
+
+def launch_pack_egt_v9_tables_once(packs: dict[str, torch.Tensor], tables: dict[str, torch.Tensor], done: torch.Tensor,
+                                   heads: int, head_dim: int) -> object:
+    """Launch the run-once pack on torch tensors (`compile_pack_egt_v9_tables_once`)."""
+    return _pack_tables_once_kernel[(heads,)](
+        packs["query"], packs["key"], packs["weights"], packs["constant_bias"], tables["query"], tables["key"],
+        tables["edge_read/w"], tables["door/w"], tables["gate/w"], tables["constant_bias"], done, heads, head_dim)
+
+
+def compile_pack_egt_v9_tables_once(specialization: PackEgtV9Specialization) -> KernelArtifact:
+    """Autotune and compile the run-once pack of one block shape (`restore_value` resets the flag before every candidate)."""
+    heads, depth = specialization.heads, specialization.head_dim
+    packs = {name: torch.empty(size // 2, dtype=torch.float16, device="cuda")
+             for name, size in packed_bytes(heads, depth).items()}
+    tables = {"query": torch.zeros(heads, 34, depth, device="cuda"), "key": torch.zeros(heads, 34, depth, device="cuda"),
+              "edge_read/w": torch.zeros(heads, 16, device="cuda"), "door/w": torch.zeros(heads, 16, device="cuda"),
+              "gate/w": torch.zeros(heads, 16, device="cuda"), "constant_bias": torch.zeros(heads, 64, 64, device="cuda")}
+    done = torch.zeros(heads, device="cuda")
+    compiled = launch_pack_egt_v9_tables_once(packs, tables, done, heads, depth)
+    return artifact_from_triton(compiled, grid=(heads, 1, 1), parameters=(_POINTER,) * 11, autotuner=_pack_tables_once_kernel)
+
+
 def pack_egt_v9_tables(
     builder: ProgramBuilder,
     kernels: KernelCache,
     packs: dict[str, Buffer],
     tables: dict[str, Buffer],
     specialization: PackEgtV9Specialization,
+    done: Buffer | None = None,
 ) -> None:
-    """Append the pack call of one block: `packs` (PACKED_TABLES) from the block's FP32 plans (BLOCK_TABLES' short names)."""
+    """Append the pack call of one block: `packs` (PACKED_TABLES) from the block's FP32 plans (BLOCK_TABLES' short names).
+
+    With `done` (a persistent FP32 [heads] the loader zeroes; LC0EX_EGT_V9_PACK_ONCE) the run-once kernel packs on the
+    rung's first batch and skips every later one.
+    """
     builder.set_target(lc0ex_pb2.Target.VENDOR_NVIDIA, f"sm_{specialization.architecture}")
-    kernel = kernels.get(compile_pack_egt_v9_tables, specialization)
     reads = tuple(tables[name] for name in ("query", "key", "edge_read/w", "door/w", "gate/w", "constant_bias"))
+    if done is not None:
+        kernel = kernels.get(compile_pack_egt_v9_tables_once, specialization)
+        builder.call(kernel, *(packs[name] for name in PACKED_TABLES), *reads, done, readonly=reads)
+        return
+    kernel = kernels.get(compile_pack_egt_v9_tables, specialization)
     builder.call(kernel, *(packs[name] for name in PACKED_TABLES), *reads, readonly=reads)
 
 

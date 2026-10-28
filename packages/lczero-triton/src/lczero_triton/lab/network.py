@@ -276,6 +276,8 @@ _TRIPLET_MMA_CONTROL = os.environ.get("LC0EX_TRIPLET_MMA_CONTROL", "")
 # LC0EX_EGT_V9_FFN_COPY=1: on a v9 rung the site's last stage (edge site "ffn" or "site") also writes v9's FP16 cell-major state
 # copy of e', instead of a separate `cast_state_cell_major` after the site (the same bits). Not with LC0EX_TRIPLET_OUT_FFN.
 _EGT_V9_FFN_COPY = os.environ.get("LC0EX_EGT_V9_FFN_COPY", "0") == "1"
+# LC0EX_EGT_V9_PACK_ONCE=1: write the block's FP16 packs on the rung's first batch only.
+_EGT_V9_PACK_ONCE = os.environ.get("LC0EX_EGT_V9_PACK_ONCE", "0") == "1"
 # r23b §7 (pricing): which EGT2 blocks read the edge stream. The exported family reads it in every block; this serves
 # the net that reads it only in the named blocks -- elsewhere the head program's state terms are compiled out, exact
 # for a net whose read, door and gate weights and gate bias are zero there. "all" (default, unchanged), "none",
@@ -1307,8 +1309,10 @@ def _encoder_egt(  # noqa: PLR0913
         packs = {name: context.builder.persistent_tensor(shape=(size // _F16_BYTES,), dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
                                                          writable=True, alignment_bytes=256)
                  for name, size in packed_bytes(shape.heads, shape.head_dim).items()}
+        done = (context.builder.persistent_tensor(shape=(shape.heads,), dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32, writable=True,
+                                                  alignment_bytes=256) if _EGT_V9_PACK_ONCE else None)
         pack_egt_v9_tables(context.builder, context.kernels, packs, tables,
-                           PackEgtV9Specialization(shape.heads, shape.head_dim, context.architecture))
+                           PackEgtV9Specialization(shape.heads, shape.head_dim, context.architecture), done=done)
         attention_egt_v9(
             context.builder, context.kernels, merged, qkv, edges, edge_norm, edge_state, served_tables(tables, packs),
             AttentionEgtV9Specialization(
