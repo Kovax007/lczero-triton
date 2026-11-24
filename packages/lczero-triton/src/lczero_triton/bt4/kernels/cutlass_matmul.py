@@ -440,11 +440,15 @@ def shared_storage_bytes(
             text=True,
         )
     measured = int(completed.stdout.strip())
-    if measured > _DYNAMIC_SHARED_LIMIT:
+    # The device's own opt-in ceiling (A100 166,912 B; sm_89 / sm_120 101,376 B),
+    # as cutlass_gemm_i8 already does: the sweep times tiles on this card, so a
+    # tile it picks must not be refused against another architecture's limit.
+    limit = dynamic_shared_limit()
+    if measured > limit:
         message = (
             f"tile {threadblock} x {warp} at {stages} stages needs "
-            f"{measured} B of shared memory, over sm_89's "
-            f"{_DYNAMIC_SHARED_LIMIT} B ceiling"
+            f"{measured} B of shared memory, over this device's "
+            f"{limit} B opt-in ceiling"
         )
         raise ValueError(message)
     _SHARED_BYTES_CACHE[key] = measured
