@@ -12,6 +12,9 @@ _POLICY_SIZE = 1858
 _POLICY_INPUT_SIZE = 4288
 _SYMBOL_NAME = "lczero_bt4_mapping_table"
 _BLACKWELL_ARCHITECTURE = 100
+# ptxas refuses .version 8.7 for these targets; 8.8 (CUDA 12.9) assembles them.
+# Every other target keeps its version, so older ptxas builds keep working.
+_PTX_8_8_ARCHITECTURES = frozenset({103, 121})
 _ENCODED_TABLE = (
     b"c-k%51(y)S8U|oe=>}oxl$Ms3?q0gPmhJ}W?(SH+yFpr7VnJG3VnJH^KAy`t^ZbJM%*^-BgbfoWOgO?5frxy^_e3HxQHVus;*gNU"
     b"q#zCH$wD^rke6R5LNSU{f|8V?G-W7DIm%Oos#GJ8I@G5LEoegrI@6Qh4B}UYFqB~oX9Ob|#c0MbmWfPaGE<n!Z050;WvpU7o7lx~"
@@ -69,7 +72,10 @@ def compile_symbol(*, architecture: str) -> SymbolArtifact:
     """Compile the immutable attention-policy gather table as a module symbol."""
     entries = ", ".join(str(value) for value in values())
     architecture_number = int(architecture.removeprefix("sm_"))
-    ptx_version = "8.7" if architecture_number >= _BLACKWELL_ARCHITECTURE else "8.0"
+    if architecture_number in _PTX_8_8_ARCHITECTURES:
+        ptx_version = "8.8"
+    else:
+        ptx_version = "8.7" if architecture_number >= _BLACKWELL_ARCHITECTURE else "8.0"
     ptx = "\n".join(
         (
             f".version {ptx_version}",
