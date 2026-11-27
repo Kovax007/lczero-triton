@@ -35,13 +35,14 @@ conversion uses (`layer_norm`, `quantise_operand`), so one artifact has one roun
 round-half-to-even only on exact ties.
 """
 
+import json
 import logging
 import math
 import os
 import subprocess
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -101,6 +102,11 @@ class CutlassGemmI8Specialization:
     output: str = "f16"
     # BT6-test's `ffn_softcap` on the GLU's two branches (0 = off), as `cutlass_matmul`'s `glu_softcap`.
     glu_softcap: float = 0.0
+    # Backend 11-27 (A100 profile step 2), all off by default; see the variant notes at _VARIANT_NOTES.
+    splits: int = 1
+    skip_smem: bool = False
+    skip_prefetch: bool = False
+    prescale_cache: bool = False
 
     def __post_init__(self) -> None:
         """Refuse a combination the rendered kernel does not implement."""
@@ -119,6 +125,15 @@ class CutlassGemmI8Specialization:
         if self.glu_softcap < 0.0 or self.glu_softcap != self.glu_softcap:
             message = f"glu_softcap must be >= 0 (0 = off); got {self.glu_softcap}"
             raise ValueError(message)
+        if self.splits < 1:
+            message = f"CutlassGemmI8Specialization.splits={self.splits}; expected >= 1"
+            raise ValueError(message)
+        if (self.skip_smem or self.skip_prefetch) and self.epilogue != "residual":
+            message = "skip_smem / skip_prefetch need epilogue='residual'"
+            raise ValueError(message)
+        if self.prescale_cache and not (self.epilogue == "glu" and self.output == "i8"):
+            message = "prescale_cache needs epilogue='glu' with output='i8'"
+            raise ValueError(message)
         if not i8_supports(self.gemm_n, self.k):
             message = (f"int8 GEMM widths n={self.gemm_n}, k={self.k} must be multiples of {I8_ALIGNMENT} "
                        "(128-bit rows on both int8 operands)")
@@ -132,7 +147,16 @@ class CutlassGemmI8Specialization:
     @property
     def family(self) -> str:
         """The tile-cache family: the epilogue changes the register budget, so it is part of the key."""
-        return f"i8_{self.epilogue}_{self.output}"
+        return f"i8_{self.epilogue}_{self.output}{self.variant_suffix}"
+
+    @property
+    def variant_suffix(self) -> str:
+        """'' for the original kernel; otherwise one marker per enabled variant (entry name and tile-cache family)."""
+        suffix = f"_sk{self.splits}" if self.splits > 1 else ""
+        suffix += "_ss" if self.skip_smem else ""
+        suffix += "_pf" if self.skip_prefetch else ""
+        suffix += "_pc" if self.prescale_cache else ""
+        return suffix
 
 
 def i8_supports(n: int, k: int) -> bool:
@@ -147,6 +171,7 @@ def entry_point_name(specialization: CutlassGemmI8Specialization) -> str:
         suffix += "_cap" + f"{specialization.glu_softcap:g}".replace(".", "p").replace("-", "m").replace("+", "")
     if specialization.output != "f16":
         suffix += f"_{specialization.output}out"
+    suffix += specialization.variant_suffix
     return f"lc0ex_cutlass_gemm_i8_m{specialization.m}_n{specialization.n}_k{specialization.k}{suffix}"
 
 
@@ -239,7 +264,7 @@ struct Lc0I8Visitor {{
   const float* prescale_;
   float scale_cache_[kColumnIterations][8];
   float bias_cache_[kColumnIterations][8];
-
+{visitor_members}
   CUTLASS_DEVICE Lc0I8Visitor(int thread_index, cutlass::MatrixCoord const& threadblock_offset,
                               {output_type}* output, const float* scale, const float* bias,
                               const cutlass::half_t* skip, const float* prescale)
@@ -264,7 +289,7 @@ struct Lc0I8Visitor {{
         bias_cache_[c][4] = b1.x; bias_cache_[c][5] = b1.y; bias_cache_[c][6] = b1.z; bias_cache_[c][7] = b1.w;
       }}
     }}
-  }}
+{begin_epilogue_tail}  }}
   CUTLASS_DEVICE void begin_step(int) {{}}
   CUTLASS_DEVICE void begin_row(int) {{}}
   CUTLASS_DEVICE void end_row(int) {{}}
@@ -293,7 +318,7 @@ using Epilogue = typename cutlass::epilogue::threadblock::EpilogueWithVisitorFro
 union SharedStorage {{
   typename Mma::SharedStorage main_loop;
   typename Epilogue::SharedStorage epilogue;
-}};
+{shared_extra}}};
 
 }}  // namespace
 """
@@ -316,6 +341,137 @@ _VISIT_RESIDUAL = """    const uint4 raw_skip =
     *reinterpret_cast<uint4*>(output_ + static_cast<int64_t>(row) * kOutputColumns + column) =
         *reinterpret_cast<uint4 const*>(&packed);"""
 
+_VARIANT_NOTES = """Backend 11-27 variants (all off by default; the original kernel renders unchanged):
+* splits=S: split-K over S CTAs per tile, int32 partials in a workspace (fragment order), the last CTA of a tile adds them
+  and runs the unchanged epilogue; a per-tile counter (zero before the first launch) is reset by that CTA. Bit-exact.
+* skip_smem: the residual epilogue's FP16 skip tile is staged in shared memory by one cp.async group after the main loop.
+* skip_prefetch: the CTA prefetches its skip tile to L2 before the main loop.
+* prescale_cache: the GLU int8 epilogue caches the ffn_mid prescale in registers, as scale and bias.
+"""
+
+# The residual visit with the skip tile staged in shared memory (skip_smem): same arithmetic, same order.
+_VISIT_RESIDUAL_SMEM = """    const uint4 raw_skip = *reinterpret_cast<uint4 const*>(
+        skip_ + (row - skip_row0_) * ThreadblockShape::kN + (column - skip_column0_));
+    cutlass::Array<cutlass::half_t, 8> const& skip = *reinterpret_cast<cutlass::Array<cutlass::half_t, 8> const*>(&raw_skip);
+    cutlass::Array<cutlass::half_t, 8> packed;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < 8; ++i) packed[i] = cutlass::half_t(value[i] + static_cast<float>(skip[i]));
+    *reinterpret_cast<uint4*>(output_ + static_cast<int64_t>(row) * kOutputColumns + column) =
+        *reinterpret_cast<uint4 const*>(&packed);"""
+
+_SPLIT_PROLOGUE = """  constexpr int kSplits = {splits};
+  static_assert(kK % ThreadblockShape::kK == 0, "split-K reduces whole K tiles");
+  constexpr int kKTiles = kK / ThreadblockShape::kK;
+  static_assert(kSplits <= kKTiles, "more splits than K tiles");
+  const int split = blockIdx.z;
+  const int k_tile_begin = split * kKTiles / kSplits;
+  const int k_tile_end = (split + 1) * kKTiles / kSplits;
+"""
+
+# Every CTA stores its int32 accumulators (fragment order: vector v of thread t at [(tile * S + split) * V + v] * T + t);
+# the last of a tile's S CTAs adds the other S - 1 partials in int32 and goes on to the epilogue.
+_SPLIT_FIXUP = """  {
+    constexpr int kThreads = Mma::WarpCount::kCount * 32;
+    constexpr int kVectors = Mma::FragmentC::kElements / 4;
+    static_assert(Mma::FragmentC::kElements % 4 == 0, "int4 partials");
+    const int tile_index = tile_row * gridDim.y + tile_column;
+    int4* partials = reinterpret_cast<int4*>(workspace);
+    const int64_t own = static_cast<int64_t>(tile_index * kSplits + split) * kVectors * kThreads + threadIdx.x;
+    CUTLASS_PRAGMA_UNROLL
+    for (int v = 0; v < kVectors; ++v) {
+      __stcg(partials + own + static_cast<int64_t>(v) * kThreads,
+             make_int4(accumulators[4 * v], accumulators[4 * v + 1], accumulators[4 * v + 2], accumulators[4 * v + 3]));
+    }
+    __threadfence();
+    __syncthreads();
+    __shared__ int lc0ex_split_last;
+    if (threadIdx.x == 0) lc0ex_split_last = atomicAdd(counters + tile_index, 1) == kSplits - 1;
+    __syncthreads();
+    if (!lc0ex_split_last) return;
+    __threadfence();
+    for (int s = 0; s < kSplits; ++s) {
+      if (s == split) continue;
+      const int64_t other = static_cast<int64_t>(tile_index * kSplits + s) * kVectors * kThreads + threadIdx.x;
+      CUTLASS_PRAGMA_UNROLL
+      for (int v = 0; v < kVectors; ++v) {
+        const int4 p = __ldcg(partials + other + static_cast<int64_t>(v) * kThreads);
+        accumulators[4 * v] += p.x;
+        accumulators[4 * v + 1] += p.y;
+        accumulators[4 * v + 2] += p.z;
+        accumulators[4 * v + 3] += p.w;
+      }
+    }
+    if (threadIdx.x == 0) counters[tile_index] = 0;
+  }
+"""
+
+_SKIP_PREFETCH = """  {
+    constexpr int kThreads = Mma::WarpCount::kCount * 32;
+    constexpr int kLinesPerRow = (ThreadblockShape::kN * 2 + 127) / 128;
+    const int prefetch_row0 = tile_row * ThreadblockShape::kM;
+    const int prefetch_column0 = tile_column * ThreadblockShape::kN;
+    for (int i = threadIdx.x; i < ThreadblockShape::kM * kLinesPerRow; i += kThreads) {
+      const int r = prefetch_row0 + i / kLinesPerRow;
+      if (r < kM) {
+        const cutlass::half_t* line = skip + static_cast<int64_t>(r) * kOutputColumns + prefetch_column0 + (i % kLinesPerRow) * 64;
+        asm volatile("prefetch.global.L2 [%0];\\n" :: "l"(line));
+      }
+    }
+  }
+"""
+
+# After the main loop (which ends with cp.async drained and a barrier) the skip tile goes to its own shared region, behind
+# the epilogue's staging buffer; out-of-range chunks are zero-filled and never read (the visitor skips those rows).
+_SKIP_STAGE = """  {
+    constexpr int kThreads = Mma::WarpCount::kCount * 32;
+    constexpr int kChunksPerRow = ThreadblockShape::kN / 8;
+    constexpr int kChunks = ThreadblockShape::kM * kChunksPerRow;
+    static_assert(kChunks % kThreads == 0, "whole 16-byte chunks per thread");
+    const int stage_row0 = tile_row * ThreadblockShape::kM;
+    const int stage_column0 = tile_column * ThreadblockShape::kN;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kChunks / kThreads; ++i) {
+      const int chunk = threadIdx.x + i * kThreads;
+      const int r = chunk / kChunksPerRow;
+      const int c = (chunk % kChunksPerRow) * 8;
+      const bool inside = stage_row0 + r < kM && stage_column0 + c < kOutputColumns;
+      const cutlass::half_t* source = inside ? skip + static_cast<int64_t>(stage_row0 + r) * kOutputColumns + stage_column0 + c : skip;
+      const unsigned target = static_cast<unsigned>(__cvta_generic_to_shared(shared.skip.tile + r * ThreadblockShape::kN + c));
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\\n" :: "r"(target), "l"(source), "r"(inside ? 16 : 0));
+    }
+    asm volatile("cp.async.commit_group;\\n" ::);
+  }
+"""
+
+_SKIP_SHARED = """  struct {
+    typename Epilogue::SharedStorage epilogue;
+    alignas(16) cutlass::half_t tile[ThreadblockShape::kM * ThreadblockShape::kN];
+  } skip;
+"""
+
+_PRESCALE_CACHE_LOAD = """    CUTLASS_PRAGMA_UNROLL
+    for (int c = 0; c < kColumnIterations; ++c) {
+      const int column = coordinates_.thread_start().column() + OutputTileIterator::ThreadMap::iteration_offset(c).column();
+      if (column < kN) {
+        const float4 r = *reinterpret_cast<const float4*>(prescale_ + column / 2);
+        prescale_cache_[c][0] = r.x; prescale_cache_[c][1] = r.y; prescale_cache_[c][2] = r.z; prescale_cache_[c][3] = r.w;
+      }
+    }
+"""
+
+_SPLIT_SWEEP_ALLOC = """  void *counters = nullptr, *workspace = nullptr;
+  {
+    const size_t tiles = (size_t)((kM + ThreadblockShape::kM - 1) / ThreadblockShape::kM) *
+                         ((kN + ThreadblockShape::kN - 1) / ThreadblockShape::kN);
+    if (cudaMalloc(&counters, tiles * 4) != cudaSuccess ||
+        cudaMalloc(&workspace, tiles * {splits} * ThreadblockShape::kM * ThreadblockShape::kN * 4) != cudaSuccess) {
+      std::printf("-1\\n");
+      return 0;
+    }
+    cudaMemset(counters, 0, tiles * 4);
+  }
+"""
+
 # Interleaved pairs: value[2p] is the gate of hidden column column/2 + p, value[2p + 1] its up.
 _VISIT_GLU_HEAD = """    const int hidden = column / 2;
     float h[4];
@@ -334,6 +490,17 @@ _VISIT_GLU_F16 = """    cutlass::Array<cutlass::half_t, 4> packed;
 # The ffn_mid codes: floor(h * r + 0.5) clamped to +-127, the norm's rule; four codes in one 32-bit store.
 _VISIT_GLU_I8 = """    const float4 r = *reinterpret_cast<const float4*>(prescale_ + hidden);
     const float rs[4] = {r.x, r.y, r.z, r.w};
+    uint32_t word = 0;
+    CUTLASS_PRAGMA_UNROLL
+    for (int p = 0; p < 4; ++p) {
+      const float code = fminf(fmaxf(floorf(fmaf(h[p], rs[p], 0.5f)), -127.0f), 127.0f);
+      word |= (static_cast<uint32_t>(static_cast<int32_t>(code)) & 0xffu) << (8 * p);
+    }
+    *reinterpret_cast<uint32_t*>(output_ + static_cast<int64_t>(row) * kOutputColumns + hidden) = word;"""
+
+# The same codes with the prescale cached in registers (prescale_cache): identical values, no per-fragment reload.
+_VISIT_GLU_I8_CACHED = """    const float rs[4] = {prescale_cache_[group][0], prescale_cache_[group][1], prescale_cache_[group][2],
+                         prescale_cache_[group][3]};
     uint32_t word = 0;
     CUTLASS_PRAGMA_UNROLL
     for (int p = 0; p < 4; ++p) {
@@ -392,15 +559,15 @@ extern "C" __global__ __launch_bounds__({threads}) void {entry}(
   if (tile_row * ThreadblockShape::kM >= kM) return;
   if (tile_column * ThreadblockShape::kN >= kN) return;
 
-  const cutlass::MatrixCoord offset_a{{tile_row * ThreadblockShape::kM, 0}};
-  const cutlass::MatrixCoord offset_b{{0, tile_column * ThreadblockShape::kN}};
-  const int k_iterations = (kK + ThreadblockShape::kK - 1) / ThreadblockShape::kK;
+{kernel_prologue}  const cutlass::MatrixCoord offset_a{{tile_row * ThreadblockShape::kM, {k_begin}}};
+  const cutlass::MatrixCoord offset_b{{{k_begin}, tile_column * ThreadblockShape::kN}};
+  const int k_iterations = {k_iterations};
 
   // A is the [M, K] codes (row-major); B is [N, K] row-major = [K, N] column-major, leading dimension K.
   typename Mma::IteratorA iterator_a(
-      typename Mma::IteratorA::Params(LayoutA(kK)), const_cast<ElementA*>(a), {{kM, kK}}, threadIdx.x, offset_a);
+      typename Mma::IteratorA::Params(LayoutA(kK)), const_cast<ElementA*>(a), {{kM, {k_extent}}}, threadIdx.x, offset_a);
   typename Mma::IteratorB iterator_b(
-      typename Mma::IteratorB::Params(LayoutB(kK)), const_cast<ElementB*>(b), {{kK, kN}}, threadIdx.x, offset_b);
+      typename Mma::IteratorB::Params(LayoutB(kK)), const_cast<ElementB*>(b), {{{k_extent}, kN}}, threadIdx.x, offset_b);
 
   const int warp_index = threadIdx.x / 32;
   const int lane_index = threadIdx.x % 32;
@@ -409,10 +576,10 @@ extern "C" __global__ __launch_bounds__({threads}) void {entry}(
   accumulators.clear();
   Mma mma(shared.main_loop, threadIdx.x, warp_index, lane_index);
   mma(k_iterations, accumulators, iterator_a, iterator_b, accumulators);
-
+{after_main_loop}
   const cutlass::MatrixCoord offset_d{{tile_row * ThreadblockShape::kM, tile_column * ThreadblockShape::kN}};
   Lc0I8Visitor visitor(threadIdx.x, offset_d, d, scale, bias, {skip_argument}, {prescale_argument});
-  Epilogue epilogue(shared.epilogue, threadIdx.x, warp_index, lane_index);
+{visitor_setup}  Epilogue epilogue(shared.epilogue, threadIdx.x, warp_index, lane_index);
   epilogue(visitor, accumulators);
 }}
 """
@@ -442,13 +609,13 @@ int main() {{
   cudaMemset(bias, 0, (size_t)kN * 4);
   cudaMemset(skip, 0, (size_t)kM * kN * 2);
   cudaMemset(prescale, 0, (size_t)kN * 4);
-  const int shared_bytes = (int)sizeof(SharedStorage);
+{sweep_alloc}  const int shared_bytes = (int)sizeof(SharedStorage);
   if (cudaFuncSetAttribute((const void*)&{entry}, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes) !=
       cudaSuccess) {{
     std::printf("-1\n");
     return 0;
   }}
-  const dim3 grid((kM + ThreadblockShape::kM - 1) / ThreadblockShape::kM, (kN + ThreadblockShape::kN - 1) / ThreadblockShape::kN, 1);
+  const dim3 grid((kM + ThreadblockShape::kM - 1) / ThreadblockShape::kM, (kN + ThreadblockShape::kN - 1) / ThreadblockShape::kN, {splits});
   const dim3 block({threads}, 1, 1);
   for (int i = 0; i < 20; ++i) {entry}<<<grid, block, shared_bytes>>>({sweep_arguments});
   if (cudaDeviceSynchronize() != cudaSuccess) {{
@@ -512,12 +679,14 @@ def _visit_body(specialization: CutlassGemmI8Specialization) -> str:
     if specialization.epilogue == "bias":
         return _VISIT_BIAS
     if specialization.epilogue == "residual":
-        return _VISIT_RESIDUAL
+        return _VISIT_RESIDUAL_SMEM if specialization.skip_smem else _VISIT_RESIDUAL
     if specialization.epilogue == "mish":
         return _VISIT_MISH_I8 if specialization.output == "i8" else _VISIT_MISH_F16
     fields = _glu_fields(specialization)
     head = _VISIT_GLU_HEAD.replace("{gate_expr}", fields["gate_expr"]).replace("{up_expr}", fields["up_expr"])
-    return head + "\n" + (_VISIT_GLU_I8 if specialization.output == "i8" else _VISIT_GLU_F16)
+    if specialization.output == "i8":
+        return head + "\n" + (_VISIT_GLU_I8_CACHED if specialization.prescale_cache else _VISIT_GLU_I8)
+    return head + "\n" + _VISIT_GLU_F16
 
 
 def _parameter_fields(specialization: CutlassGemmI8Specialization) -> dict[str, str]:
@@ -530,6 +699,11 @@ def _parameter_fields(specialization: CutlassGemmI8Specialization) -> dict[str, 
     if specialization.output == "i8":
         extra, prescale = ", const float* prescale", "prescale"
         sweep.append("static_cast<const float*>(prescale)")
+    if specialization.splits > 1:
+        extra += ", int* counters, int* workspace"
+        sweep.extend(("static_cast<int*>(counters)", "static_cast<int*>(workspace)"))
+    if specialization.skip_smem:
+        skip = "shared.skip.tile"
     output_type = "int8_t" if specialization.output == "i8" else "cutlass::half_t"
     return {
         "extra_parameters": extra,
@@ -537,6 +711,36 @@ def _parameter_fields(specialization: CutlassGemmI8Specialization) -> dict[str, 
         "prescale_argument": prescale,
         "output_type": output_type,
         "sweep_arguments": ", ".join(sweep).replace("{t}", output_type),
+    }
+
+
+def _variant_fields(specialization: CutlassGemmI8Specialization) -> dict[str, str]:
+    """Template fields of the 11-27 variants; all empty / original text when no variant is on."""
+    split = specialization.splits > 1
+    prologue = _SPLIT_PROLOGUE.replace("{splits}", str(specialization.splits)) if split else ""
+    if specialization.skip_prefetch:
+        prologue += _SKIP_PREFETCH
+    after = (_SPLIT_FIXUP if split else "") + (_SKIP_STAGE if specialization.skip_smem else "")
+    members, tail = "", ""
+    if specialization.skip_smem:
+        members += "  int skip_row0_ = 0;\n  int skip_column0_ = 0;\n"
+        tail += '    asm volatile("cp.async.wait_all;\\n" ::: "memory");\n'
+    if specialization.prescale_cache:
+        members += "  float prescale_cache_[kColumnIterations][4];\n"
+        tail = _PRESCALE_CACHE_LOAD + tail
+    return {
+        "kernel_prologue": prologue,
+        "k_begin": "k_tile_begin * ThreadblockShape::kK" if split else "0",
+        "k_iterations": "k_tile_end - k_tile_begin" if split else "(kK + ThreadblockShape::kK - 1) / ThreadblockShape::kK",
+        "k_extent": "k_tile_end * ThreadblockShape::kK" if split else "kK",
+        "after_main_loop": after,
+        "visitor_setup": ("  visitor.skip_row0_ = offset_d.row();\n  visitor.skip_column0_ = offset_d.column();\n"
+                          if specialization.skip_smem else ""),
+        "visitor_members": members,
+        "begin_epilogue_tail": tail,
+        "shared_extra": _SKIP_SHARED if specialization.skip_smem else "",
+        "sweep_alloc": _SPLIT_SWEEP_ALLOC.replace("{splits}", str(specialization.splits)) if split else "",
+        "splits": str(specialization.splits),
     }
 
 
@@ -551,6 +755,7 @@ def _render(template: str, specialization: CutlassGemmI8Specialization, tile: Ti
         glu_softcap_decl=_glu_fields(specialization)["glu_softcap_decl"],
         visit_body=_visit_body(specialization),
         **fields,
+        **_variant_fields(specialization),
     )
 
 
@@ -707,7 +912,7 @@ def shared_storage_bytes(specialization: CutlassGemmI8Specialization, *,
                          include_directories: Sequence[Path | str] = (CUTLASS_INCLUDE,)) -> int:
     """`sizeof(SharedStorage)` from nvcc (a CUTLASS template computation), cached per tile and epilogue."""
     tile = select_tile(specialization)
-    key = (tile, specialization.epilogue, specialization.output)
+    key = (tile, specialization.epilogue, specialization.output, specialization.skip_smem)
     cached = _SHARED_BYTES.get(key)
     if cached is not None:
         return cached
@@ -736,17 +941,85 @@ def compile_cutlass_gemm_i8(specialization: CutlassGemmI8Specialization, *,
     threadblock, warp, _ = select_tile(specialization)
     cubin = compile_cuda(render_source(specialization), architecture=f"sm_{specialization.architecture}",
                          include_directories=include_directories, extra_arguments=("-w",))
-    grid = (-(-specialization.m // threadblock[0]), -(-specialization.gemm_n // threadblock[1]), 1)
+    grid = (-(-specialization.m // threadblock[0]), -(-specialization.gemm_n // threadblock[1]), specialization.splits)
     parameters = [_POINTER] * 5
     if specialization.epilogue == "residual":
         parameters.append(_POINTER)
     if specialization.output == "i8":
         parameters.append(_POINTER)
+    if specialization.splits > 1:
+        parameters.extend((_POINTER, _POINTER))
     return artifact_from_cubin(
         cubin, function=entry_point_name(specialization), parameters=tuple(parameters), grid=grid,
         block=(_thread_count(threadblock, warp), 1, 1),
         dynamic_shared_memory_bytes=shared_storage_bytes(specialization, include_directories=include_directories),
     )
+
+
+_VARIANT_TABLE: dict[str, dict[str, object]] | None = None
+
+
+def _variant_table() -> dict[str, dict[str, object]]:
+    """LC0EX_I8_VARIANTS: JSON {original tile-cache key: {"tile", "splits", "skip_smem", "skip_prefetch", "prescale_cache"}}."""
+    global _VARIANT_TABLE  # noqa: PLW0603
+    if _VARIANT_TABLE is None:
+        path = os.environ.get("LC0EX_I8_VARIANTS", "")
+        _VARIANT_TABLE = json.loads(Path(path).read_text(encoding="utf-8")) if path else {}
+    return _VARIANT_TABLE
+
+
+def apply_variant(specialization: CutlassGemmI8Specialization) -> CutlassGemmI8Specialization:
+    """The site's measured variant and tile from LC0EX_I8_VARIANTS, keyed by the original site; else the site unchanged."""
+    table = _variant_table()
+    if not table:
+        return specialization
+    architecture, multiprocessors = device_key()
+    entry = table.get(_cache_key(specialization, architecture, multiprocessors))
+    if entry is None:
+        return specialization
+    chosen = replace(specialization, splits=int(entry.get("splits", 1)), skip_smem=bool(entry.get("skip_smem", False)),
+                     skip_prefetch=bool(entry.get("skip_prefetch", False)),
+                     prescale_cache=bool(entry.get("prescale_cache", False)))
+    threadblock, warp, stages = entry["tile"]
+    tile: Tile = (tuple(threadblock), tuple(warp), int(stages))  # type: ignore[assignment]
+    _MEMO[(chosen.m, chosen.gemm_n, chosen.k, chosen.family)] = tile
+    _LOGGER.info("int8 variant at m=%d n=%d k=%d (%s): %s, tile %s", chosen.m, chosen.gemm_n, chosen.k,
+                 specialization.family, chosen.variant_suffix or "original kernel", tile)
+    return chosen
+
+
+_SPLIT_COUNTER_SLOTS = 4096
+_SPLIT_RESET_SOURCE = """extern "C" __global__ __launch_bounds__(256) void lc0ex_i8_split_counter_reset(unsigned int* counters) {
+  const int i = blockIdx.x * 256 + threadIdx.x;
+  if (i < %d) counters[i] = 0u;
+}
+""" % _SPLIT_COUNTER_SLOTS
+
+
+@dataclass(frozen=True, slots=True)
+class SplitCounterResetSpecialization:
+    """The split-K counter reset kernel of one architecture."""
+
+    architecture: int
+
+
+def compile_split_counter_reset(specialization: SplitCounterResetSpecialization) -> KernelArtifact:
+    """The kernel that zeroes a program's split-K counters (4096 int32) before its first split-K GEMM."""
+    cubin = compile_cuda(_SPLIT_RESET_SOURCE, architecture=f"sm_{specialization.architecture}", include_directories=(),
+                         extra_arguments=("-w",))
+    return artifact_from_cubin(cubin, function="lc0ex_i8_split_counter_reset", parameters=(_POINTER,),
+                               grid=(_SPLIT_COUNTER_SLOTS // 256, 1, 1), block=(256, 1, 1), dynamic_shared_memory_bytes=0)
+
+
+def _split_counters(builder: ProgramBuilder, kernels: KernelCache, architecture: int) -> Buffer:
+    """This program's split-K counter buffer; the first request also appends the call that zeroes it."""
+    counters = getattr(builder, "_lc0ex_i8_split_counters", None)
+    if counters is None:
+        counters = builder.tensor(shape=(_SPLIT_COUNTER_SLOTS,), dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32, writable=True,
+                                  alignment_bytes=256)
+        builder.call(kernels.get(compile_split_counter_reset, SplitCounterResetSpecialization(architecture)), counters)
+        builder._lc0ex_i8_split_counters = counters  # type: ignore[attr-defined]  # noqa: SLF001
+    return counters
 
 
 def cutlass_gemm_i8(  # noqa: PLR0913
@@ -770,10 +1043,22 @@ def cutlass_gemm_i8(  # noqa: PLR0913
         message = "cutlass_gemm_i8: a prescale buffer goes with output='i8' and only with it"
         raise ValueError(message)
     builder.set_target(lc0ex_pb2.Target.VENDOR_NVIDIA, f"sm_{specialization.architecture}")
+    specialization = apply_variant(specialization)
     kernel = kernels.get(compile_cutlass_gemm_i8, specialization)
     arguments: tuple[Buffer, ...] = (output, codes, weights, scale, bias)
     if skip is not None:
         arguments += (skip,)
     if prescale is not None:
         arguments += (prescale,)
-    builder.call(kernel, *arguments, readonly=list(arguments[1:]))
+    readonly = list(arguments[1:])
+    if specialization.splits > 1:
+        threadblock = select_tile(specialization)[0]
+        tiles = -(-specialization.m // threadblock[0]) * -(-specialization.gemm_n // threadblock[1])
+        if tiles > _SPLIT_COUNTER_SLOTS:
+            message = f"split-K site with {tiles} tiles; the program's counter buffer has {_SPLIT_COUNTER_SLOTS}"
+            raise ValueError(message)
+        counters = _split_counters(builder, kernels, specialization.architecture)
+        workspace = builder.temporary_buffer(
+            size_bytes=tiles * specialization.splits * threadblock[0] * threadblock[1] * 4, alignment_bytes=256)
+        arguments += (counters, workspace)
+    builder.call(kernel, *arguments, readonly=readonly)
